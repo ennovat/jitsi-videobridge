@@ -25,40 +25,6 @@ import org.jitsi.metaconfig.optionalconfig
 
 class IceConfig private constructor() {
     /**
-     * Is ICE/TCP enabled.
-     */
-    val tcpEnabled: Boolean by config {
-        // The old property is named 'disable', while the new one
-        // is 'enable', so invert the old value
-        "org.jitsi.videobridge.DISABLE_TCP_HARVESTER".from(JitsiConfig.legacyConfig).transformedBy { !it }
-        "videobridge.ice.tcp.enabled".from(JitsiConfig.newConfig)
-    }
-
-    /**
-     * The ICE/TCP port.
-     */
-    val tcpPort: Int by config {
-        "org.jitsi.videobridge.TCP_HARVESTER_PORT".from(JitsiConfig.legacyConfig)
-        "videobridge.ice.tcp.port".from(JitsiConfig.newConfig)
-    }
-
-    /**
-     * The additional port to advertise, or null if none is configured.
-     */
-    val tcpMappedPort: Int? by optionalconfig {
-        "org.jitsi.videobridge.TCP_HARVESTER_MAPPED_PORT".from(JitsiConfig.legacyConfig)
-        "videobridge.ice.tcp.mapped-port".from(JitsiConfig.newConfig)
-    }
-
-    /**
-     * Whether ICE/TCP should use "ssltcp" or not.
-     */
-    val iceSslTcp: Boolean by config {
-        "org.jitsi.videobridge.TCP_HARVESTER_SSLTCP".from(JitsiConfig.legacyConfig)
-        "videobridge.ice.tcp.ssltcp".from(JitsiConfig.newConfig)
-    }
-
-    /**
      * The ICE UDP port.
      */
     val port: Int by config {
@@ -83,14 +49,6 @@ class IceConfig private constructor() {
             .convertFrom<String> { KeepAliveStrategy.fromString(it) }
     }
 
-    /**
-     * Whether the ice4j "component socket" mode is used.
-     */
-    val useComponentSocket: Boolean by config {
-        "org.jitsi.videobridge.USE_COMPONENT_SOCKET".from(JitsiConfig.legacyConfig)
-        "videobridge.ice.use-component-socket".from(JitsiConfig.newConfig)
-    }
-
     val resolveRemoteCandidates: Boolean by config(
         "videobridge.ice.resolve-remote-candidates".from(JitsiConfig.newConfig)
     )
@@ -106,7 +64,7 @@ class IceConfig private constructor() {
 
     /**
      * Whether to advertise ICE candidates with private IP addresses (RFC1918 IPv4 addresses and
-     * fec0::/10 or fc00::/7 IPv6 addresses).
+     * fec0::/10 or fc00::/7 IPv6 addresses) even to endpoints that have not signaled support for private addresses.
      */
     val advertisePrivateCandidates: Boolean by config(
         "videobridge.ice.advertise-private-candidates".from(JitsiConfig.newConfig)

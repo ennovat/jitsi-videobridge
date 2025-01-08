@@ -21,10 +21,11 @@ import org.jetbrains.annotations.*;
 import org.jitsi.utils.version.*;
 import org.jitsi.videobridge.*;
 import org.jitsi.videobridge.health.*;
+import org.jitsi.videobridge.metrics.*;
 import org.jitsi.videobridge.rest.*;
 import org.jitsi.videobridge.rest.binders.*;
 import org.jitsi.videobridge.rest.filters.*;
-import org.jitsi.videobridge.stats.*;
+import org.jitsi.videobridge.rest.prometheus.*;
 import org.jitsi.videobridge.xmpp.*;
 
 import static org.jitsi.videobridge.rest.RestConfig.config;
@@ -34,7 +35,6 @@ public class Application extends ResourceConfig
     public Application(
             Videobridge videobridge,
             XmppConnection xmppConnection,
-            StatsCollector statsCollector,
             @NotNull Version version,
             @NotNull JvbHealthChecker healthChecker)
 
@@ -43,7 +43,6 @@ public class Application extends ResourceConfig
             new ServiceBinder(
                 videobridge,
                 xmppConnection,
-                statsCollector,
                 healthChecker
             )
         );
@@ -59,6 +58,10 @@ public class Application extends ResourceConfig
         if (config.isEnabled(RestApis.VERSION))
         {
             register(new org.jitsi.rest.Version(version));
+        }
+        if (config.isEnabled(RestApis.PROMETHEUS))
+        {
+            register(new Prometheus(VideobridgeMetricsContainer.getInstance()));
         }
     }
 }

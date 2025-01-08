@@ -19,8 +19,11 @@ package org.jitsi.videobridge.health
 import org.ice4j.ice.harvest.MappingCandidateHarvesters
 import org.jitsi.health.HealthCheckService
 import org.jitsi.health.HealthChecker
+import org.jitsi.health.Result
 import org.jitsi.videobridge.health.config.HealthConfig.Companion.config
 import org.jitsi.videobridge.ice.Harvesters
+import org.jitsi.videobridge.metrics.VideobridgeMetricsContainer
+import java.net.InetAddress
 
 class JvbHealthChecker : HealthCheckService {
     private val healthChecker = HealthChecker(
@@ -28,22 +31,54 @@ class JvbHealthChecker : HealthCheckService {
         config.timeout,
         config.maxCheckDuration,
         config.stickyFailures,
-        healthCheckFunc = ::check
+        healthCheckFunc = ::checkAndUpdateMetric
     )
 
     fun start() = healthChecker.start()
     fun stop() = healthChecker.stop()
 
-    private fun check() {
-        if (MappingCandidateHarvesters.stunDiscoveryFailed) {
-            throw Exception("Address discovery through STUN failed")
+    private fun checkAndUpdateMetric(): Result = check().also {
+        healthyMetric.set(it.success)
+    }
+
+    private fun check(): Result {
+        if (config.requireValidAddress && !hasValidAddress()) {
+            return Result(success = false, message = "No valid IP addresses available for harvesting.")
         }
-        if (!Harvesters.isHealthy()) {
-            throw Exception("Failed to bind single-port")
+        if (config.requireStun && MappingCandidateHarvesters.stunDiscoveryFailed) {
+            return Result(success = false, message = "Address discovery through STUN failed")
+        }
+        if (!Harvesters.INSTANCE.healthy) {
+            return Result(success = false, message = "Failed to bind single-port")
         }
 
         // TODO: check if XmppConnection is configured and connected.
+
+        return Result(success = true)
     }
 
-    override fun getResult(): Exception? = healthChecker.result
+    private fun InetAddress.isValid(): Boolean {
+        return !this.isSiteLocalAddress && !this.isLinkLocalAddress && !this.isLoopbackAddress
+    }
+
+    private fun hasValidAddress(): Boolean {
+        if (Harvesters.INSTANCE.singlePortHarvesters.any { it.localAddress.address.isValid() }) {
+            return true
+        }
+        if (MappingCandidateHarvesters.getHarvesters().any { it.mask?.address?.isValid() == true }) {
+            return true
+        }
+        return false
+    }
+
+    override val result: Result
+        get() = healthChecker.result
+
+    companion object {
+        val healthyMetric = VideobridgeMetricsContainer.instance.registerBooleanMetric(
+            "healthy",
+            "Whether the Videobridge instance is healthy or not.",
+            true
+        )
+    }
 }

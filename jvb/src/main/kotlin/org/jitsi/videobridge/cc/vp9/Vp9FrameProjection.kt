@@ -89,7 +89,8 @@ internal constructor(
      * -1 if this projection is still "open" for new, later packets.
      * Projections can be closed when we switch away from their encodings.
      */
-    private var closedSeq = -1
+    var closedSeq = -1
+        private set
 
     /**
      * Ctor.
@@ -175,7 +176,9 @@ internal constructor(
         synchronized(vp9Frame) {
             return if (closedSeq < 0) {
                 true
-            } else rtpPacket.sequenceNumber isOlderThan closedSeq
+            } else {
+                rtpPacket.sequenceNumber isOlderThan closedSeq
+            }
         }
     }
 

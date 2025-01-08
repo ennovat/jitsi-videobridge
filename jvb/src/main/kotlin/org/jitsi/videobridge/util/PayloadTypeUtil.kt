@@ -27,9 +27,11 @@ import org.jitsi.nlj.format.PayloadTypeEncoding.OPUS
 import org.jitsi.nlj.format.PayloadTypeEncoding.OTHER
 import org.jitsi.nlj.format.PayloadTypeEncoding.RED
 import org.jitsi.nlj.format.PayloadTypeEncoding.RTX
+import org.jitsi.nlj.format.PayloadTypeEncoding.TELEPHONE_EVENT
 import org.jitsi.nlj.format.PayloadTypeEncoding.VP8
 import org.jitsi.nlj.format.PayloadTypeEncoding.VP9
 import org.jitsi.nlj.format.RtxPayloadType
+import org.jitsi.nlj.format.TelephoneEventPayloadType
 import org.jitsi.nlj.format.VideoRedPayloadType
 import org.jitsi.nlj.format.Vp8PayloadType
 import org.jitsi.nlj.format.Vp9PayloadType
@@ -39,6 +41,7 @@ import org.jitsi.utils.MediaType.VIDEO
 import org.jitsi.utils.logging2.Logger
 import org.jitsi.utils.logging2.LoggerImpl
 import org.jitsi.xmpp.extensions.jingle.PayloadTypePacketExtension
+import org.jitsi.xmpp.util.XmlStringBuilderUtil.Companion.toStringOpt
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -60,10 +63,7 @@ class PayloadTypeUtil {
          * @param ext the XML extension which describes the payload type.
          */
         @JvmStatic
-        fun create(
-            ext: PayloadTypePacketExtension,
-            mediaType: MediaType
-        ): PayloadType? {
+        fun create(ext: PayloadTypePacketExtension, mediaType: MediaType): PayloadType? {
             val parameters: MutableMap<String, String> = ConcurrentHashMap()
             ext.parameters.forEach { parameter ->
                 // In SDP, format parameters don't necessarily come in name=value pairs (see e.g. the format used in
@@ -74,7 +74,7 @@ class PayloadTypeUtil {
                 if (parameter.name != null) {
                     parameters[parameter.name] = parameter.value
                 } else {
-                    logger.warn("Ignoring a format parameter with no name: " + parameter.toXML())
+                    logger.warn("Ignoring a format parameter with no name: " + parameter.toStringOpt())
                 }
             }
 
@@ -97,6 +97,7 @@ class PayloadTypeUtil {
                 H264 -> H264PayloadType(id, parameters, rtcpFeedbackSet)
                 RTX -> RtxPayloadType(id, parameters)
                 OPUS -> OpusPayloadType(id, parameters)
+                TELEPHONE_EVENT -> TelephoneEventPayloadType(id, clockRate, parameters)
                 RED -> when (mediaType) {
                     AUDIO -> AudioRedPayloadType(id, clockRate, parameters)
                     VIDEO -> VideoRedPayloadType(id, clockRate, parameters, rtcpFeedbackSet)

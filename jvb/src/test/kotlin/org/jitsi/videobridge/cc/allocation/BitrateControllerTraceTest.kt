@@ -20,10 +20,8 @@ import io.kotest.core.spec.IsolationMode
 import io.kotest.core.spec.style.ShouldSpec
 import io.kotest.matchers.ints.shouldBeLessThan
 import org.jitsi.nlj.MediaSourceDesc
-import org.jitsi.nlj.RtpEncodingDesc
-import org.jitsi.nlj.VideoType
 import org.jitsi.nlj.util.bps
-import org.jitsi.test.time.FakeClock
+import org.jitsi.utils.time.FakeClock
 import java.time.Instant
 
 /**
@@ -40,37 +38,37 @@ class BitrateControllerTraceTest : ShouldSpec() {
     override fun isolationMode() = IsolationMode.InstancePerLeaf
 
     private val clock = FakeClock()
-    private val A = Endpoint("A")
-    private val B = Endpoint("B")
-    private val C = Endpoint("C")
-    private val D = Endpoint("D")
-    private val E = Endpoint("E")
-    private val F = Endpoint("F")
-    private val bc = BitrateControllerWrapper(listOf(A, B, C, D, E, F), clock = clock).apply {
+    private val a = Endpoint("A")
+    private val b = Endpoint("B")
+    private val c = Endpoint("C")
+    private val d = Endpoint("D")
+    private val e = Endpoint("E")
+    private val f = Endpoint("F")
+    private val bc = BitrateControllerWrapper(listOf(a, b, c, d, e, f), clock = clock).apply {
         bc.endpointOrderingChanged()
     }
 
     init {
         val bweEvents = javaClass.getResource("/bwe-events.csv") ?: fail("Can not read bwe-events.csv")
-        val parsedLines = bweEvents.readText().split("\n").drop(1).dropLast(1).map { ParsedLine(it) }.toList()
+        val parsedLines = bweEvents.readText().lines().drop(1).dropLast(1).map { ParsedLine(it) }.toList()
 
         context("Number of allocation changes") {
 
             println("Read ${parsedLines.size} events.")
             parsedLines.forEach { line ->
                 clock.setTime(line.time)
-                A.layer7.bitrate = line.bps_a_7.bps
-                A.layer30.bitrate = line.bps_a_30.bps
-                B.layer7.bitrate = line.bps_b_7.bps
-                B.layer30.bitrate = line.bps_b_30.bps
-                C.layer7.bitrate = line.bps_c_7.bps
-                C.layer30.bitrate = line.bps_c_30.bps
-                D.layer7.bitrate = line.bps_d_7.bps
-                D.layer30.bitrate = line.bps_d_30.bps
-                E.layer7.bitrate = line.bps_e_7.bps
-                E.layer30.bitrate = line.bps_e_30.bps
-                F.layer7.bitrate = line.bps_f_7.bps
-                F.layer30.bitrate = line.bps_f_30.bps
+                a.layer7.bitrate = line.bps_a_7.bps
+                a.layer30.bitrate = line.bps_a_30.bps
+                b.layer7.bitrate = line.bps_b_7.bps
+                b.layer30.bitrate = line.bps_b_30.bps
+                c.layer7.bitrate = line.bps_c_7.bps
+                c.layer30.bitrate = line.bps_c_30.bps
+                d.layer7.bitrate = line.bps_d_7.bps
+                d.layer30.bitrate = line.bps_d_30.bps
+                e.layer7.bitrate = line.bps_e_7.bps
+                e.layer30.bitrate = line.bps_e_30.bps
+                f.layer7.bitrate = line.bps_f_7.bps
+                f.layer30.bitrate = line.bps_f_30.bps
                 bc.bwe = line.bwe.bps
             }
 
@@ -83,14 +81,10 @@ class BitrateControllerTraceTest : ShouldSpec() {
 
     class Endpoint(
         override val id: String,
-        override var videoType: VideoType = VideoType.CAMERA,
-        override val mediaSources: Array<MediaSourceDesc> = emptyArray(),
+        override val mediaSources: Array<MediaSourceDesc> = emptyArray()
     ) : MediaSourceContainer {
         val layer7 = MockRtpLayerDesc(tid = 0, eid = 0, height = 180, frameRate = 7.5, 0.bps)
         val layer30 = MockRtpLayerDesc(tid = 2, eid = 0, height = 180, frameRate = 30.0, bitrate = 0.bps)
-
-        override val mediaSource: MediaSourceDesc =
-            MediaSourceDesc(arrayOf(RtpEncodingDesc(1L, arrayOf(layer7, layer30))))
     }
 }
 

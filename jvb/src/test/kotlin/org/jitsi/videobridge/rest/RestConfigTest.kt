@@ -20,7 +20,6 @@ import io.kotest.matchers.shouldBe
 import org.jitsi.ConfigTest
 import org.jitsi.config.withLegacyConfig
 import org.jitsi.config.withNewConfig
-import org.jitsi.videobridge.Videobridge
 import org.jitsi.videobridge.rest.RestConfig.Companion.config
 
 class RestConfigTest : ConfigTest() {
@@ -46,6 +45,9 @@ class RestConfigTest : ConfigTest() {
             }
             context("Version") {
                 config.isEnabled(RestApis.VERSION) shouldBe true
+            }
+            context("Prometheus") {
+                config.isEnabled(RestApis.PROMETHEUS) shouldBe true
             }
         }
         context("Enable/disable with new config") {
@@ -89,11 +91,16 @@ class RestConfigTest : ConfigTest() {
                     config.isEnabled(RestApis.VERSION) shouldBe false
                 }
             }
+            context("Prometheus") {
+                withNewConfig("videobridge.rest.prometheus.enabled=false") {
+                    config.isEnabled(RestApis.PROMETHEUS) shouldBe false
+                }
+            }
         }
         context("Enable/disable with the old way") {
             // The old way to enable REST is via command line argument, which is now simulated with a new config
             context("When colibri is enabled") {
-                withNewConfig("${Videobridge.REST_API_PNAME}=true") {
+                withNewConfig("videobridge.apis.rest.enabled=true") {
                     config.isEnabled(RestApis.COLIBRI) shouldBe true
 
                     context("When shutdown is enabled") {

@@ -32,7 +32,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val targetIndex = RtpLayerDesc.getIndex(0, 0, 0)
 
                 testGenerator(generator, filter, targetIndex) {
-                    _, result ->
+                        _, result ->
                     result.accept shouldBe true
                     result.mark shouldBe true
                     filter.needsKeyframe shouldBe false
@@ -47,7 +47,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val targetIndex = RtpLayerDesc.getIndex(0, 0, 2)
 
                 testGenerator(generator, filter, targetIndex) {
-                    _, result ->
+                        _, result ->
                     result.accept shouldBe true
                     result.mark shouldBe true
                     filter.needsKeyframe shouldBe false
@@ -59,7 +59,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val targetIndex = RtpLayerDesc.getIndex(0, 0, 0)
 
                 testGenerator(generator, filter, targetIndex) {
-                    f, result ->
+                        f, result ->
                     result.accept shouldBe (f.temporalLayer == 0)
                     if (result.accept) {
                         result.mark shouldBe true
@@ -73,7 +73,7 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val targetIndex = RtpLayerDesc.getIndex(0, 0, 1)
 
                 testGenerator(generator, filter, targetIndex) {
-                    f, result ->
+                        f, result ->
                     result.accept shouldBe (f.temporalLayer <= 1)
                     if (result.accept) {
                         result.mark shouldBe true
@@ -271,8 +271,11 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 testGenerator(generator, filter, targetIndex2, numFrames = 1200) { f, result ->
                     if (f.spatialLayer == 2) sawTargetLayer = true
                     if (f.isKeyframe) sawKeyframe = true
-                    result.accept shouldBe if (!sawKeyframe) (f.spatialLayer == 0) else
+                    result.accept shouldBe if (!sawKeyframe) {
+                        (f.spatialLayer == 0)
+                    } else {
                         (f.spatialLayer == 2 || !f.isInterPicturePredicted)
+                    }
                     if (result.accept) {
                         result.mark shouldBe if (!sawKeyframe) (f.spatialLayer == 0) else (f.spatialLayer == 2)
                         filter.needsKeyframe shouldBe (sawTargetLayer && !sawKeyframe)
@@ -287,9 +290,11 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 testGenerator(generator, filter, targetIndex3) { f, result ->
                     if (f.spatialLayer == 1) sawTargetLayer = true
                     if (f.isKeyframe) sawKeyframe = true
-                    result.accept shouldBe if (!sawKeyframe)
-                        ((f.spatialLayer == 2 || !f.isInterPicturePredicted) && f.temporalLayer == 0) else
+                    result.accept shouldBe if (!sawKeyframe) {
+                        ((f.spatialLayer == 2 || !f.isInterPicturePredicted) && f.temporalLayer == 0)
+                    } else {
                         (f.spatialLayer == 1 || (!f.isInterPicturePredicted && f.spatialLayer < 1))
+                    }
                     if (result.accept) {
                         result.mark shouldBe if (!sawKeyframe) (f.spatialLayer == 2) else (f.spatialLayer == 1)
                         filter.needsKeyframe shouldBe !sawKeyframe
@@ -384,9 +389,11 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
                 val targetIndex3 = RtpLayerDesc.getIndex(1, 0, 2)
                 testGenerator(generator, filter, targetIndex3) { f, result ->
                     if (f.isKeyframe) sawKeyframe = true
-                    result.accept shouldBe if (!sawKeyframe)
-                        (f.temporalLayer == 0 && (f.ssrc == 2L || f.isKeyframe)) else
+                    result.accept shouldBe if (!sawKeyframe) {
+                        (f.temporalLayer == 0 && (f.ssrc == 2L || f.isKeyframe))
+                    } else {
                         (f.ssrc == 1L || (f.isKeyframe && f.ssrc < 1L))
+                    }
                     if (result.accept) {
                         result.mark shouldBe true
                         filter.needsKeyframe shouldBe !sawKeyframe
@@ -409,15 +416,17 @@ internal class Vp9QualityFilterTest : ShouldSpec() {
         while (g.hasNext() && frames < numFrames) {
             val f = g.next()
 
-            ms = if (f.timestamp != lastTs) { f.timestamp / 90 } else { ms + 1 }
+            ms = if (f.timestamp != lastTs) {
+                f.timestamp / 90
+            } else {
+                ms + 1
+            }
             lastTs = f.timestamp
-
-            val packetIndex = RtpLayerDesc.getIndex(f.ssrc.toInt(), f.spatialLayer, f.temporalLayer)
 
             val result = filter.acceptFrame(
                 frame = f,
+                incomingEncoding = f.ssrc.toInt(),
                 externalTargetIndex = targetIndex,
-                incomingIndex = packetIndex,
                 receivedTime = Instant.ofEpochMilli(ms)
             )
             evaluator(f, result)
@@ -434,7 +443,7 @@ private abstract class FrameGenerator : Iterator<Vp9Frame>
 
 /** Generate a non-scalable series of VP9 frames, with a single keyframe at the start. */
 private class SingleLayerFrameGenerator : FrameGenerator() {
-    private val totalPictures = 1000
+    private val totalPictures = 10000
     private var pictureCount = 0
 
     override fun hasNext(): Boolean = pictureCount < totalPictures
@@ -467,7 +476,7 @@ private class SingleLayerFrameGenerator : FrameGenerator() {
 
 /** Generate a temporally-scaled series of VP9 frames, with a single keyframe at the start. */
 private class TemporallyScaledFrameGenerator : FrameGenerator() {
-    private val totalPictures = 1000
+    private val totalPictures = 10000
     private var pictureCount = 0
     private var tl0Count = -1
 
@@ -510,7 +519,7 @@ private class TemporallyScaledFrameGenerator : FrameGenerator() {
 
 /** Generate a spatially-scaled series of VP9 frames, with full spatial dependencies and periodic keyframes. */
 private class SVCFrameGenerator : FrameGenerator() {
-    private val totalPictures = 1000
+    private val totalPictures = 10000
     private var pictureCount = 0
     private var frameCount = 0
     private var tl0Count = -1
@@ -563,7 +572,7 @@ private class SVCFrameGenerator : FrameGenerator() {
 
 /** Generate a spatially-scaled series of VP9 frames, with K-SVC spatial dependencies and periodic keyframes. */
 private class KSVCFrameGenerator : FrameGenerator() {
-    private val totalPictures = 1000
+    private val totalPictures = 10000
     private var pictureCount = 0
     private var frameCount = 0
     private var tl0Count = -1
@@ -638,7 +647,8 @@ private class SimulcastFrameGenerator : FrameGenerator() {
         val keyframePicture = (pictureCount % 48) == 0
 
         val f = Vp9Frame(
-            ssrc = enc.toLong(), /* Use the encoding ID as the SSRC to make testing easier. */
+            // Use the encoding ID as the SSRC to make testing easier.
+            ssrc = enc.toLong(),
             timestamp = pictureCount * 3000L,
             earliestKnownSequenceNumber = pictureCount + (enc * 10000),
             latestKnownSequenceNumber = pictureCount + (enc * 10000),

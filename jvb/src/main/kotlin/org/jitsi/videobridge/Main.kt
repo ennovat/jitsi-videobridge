@@ -18,56 +18,47 @@ package org.jitsi.videobridge
 
 import org.eclipse.jetty.servlet.ServletHolder
 import org.glassfish.jersey.servlet.ServletContainer
+import org.ice4j.ice.harvest.AbstractUdpListener
 import org.ice4j.ice.harvest.MappingCandidateHarvesters
-import org.jitsi.cmd.CmdLine
+import org.ice4j.util.Buffer
 import org.jitsi.config.JitsiConfig
+import org.jitsi.metaconfig.ConfigException
 import org.jitsi.metaconfig.MetaconfigLogger
 import org.jitsi.metaconfig.MetaconfigSettings
+import org.jitsi.nlj.dtls.DtlsConfig
 import org.jitsi.rest.JettyBundleActivatorConfig
 import org.jitsi.rest.createServer
 import org.jitsi.rest.enableCors
 import org.jitsi.rest.isEnabled
 import org.jitsi.rest.servletContextHandler
+import org.jitsi.rtp.Packet
+import org.jitsi.rtp.rtp.RtpPacket
 import org.jitsi.shutdown.ShutdownServiceImpl
-import org.jitsi.stats.media.Utils
 import org.jitsi.utils.logging2.LoggerImpl
 import org.jitsi.utils.queue.PacketQueue
 import org.jitsi.videobridge.ice.Harvesters
+import org.jitsi.videobridge.metrics.Metrics
+import org.jitsi.videobridge.metrics.VideobridgePeriodicMetrics
 import org.jitsi.videobridge.rest.root.Application
-import org.jitsi.videobridge.stats.MucStatsTransport
-import org.jitsi.videobridge.stats.StatsCollector
-import org.jitsi.videobridge.stats.VideobridgeStatistics
-import org.jitsi.videobridge.stats.callstats.CallstatsConfig
-import org.jitsi.videobridge.stats.callstats.CallstatsService
+import org.jitsi.videobridge.stats.MucPublisher
+import org.jitsi.videobridge.util.ByteBufferPool
 import org.jitsi.videobridge.util.TaskPools
+import org.jitsi.videobridge.util.UlimitCheck
 import org.jitsi.videobridge.version.JvbVersionService
 import org.jitsi.videobridge.websocket.ColibriWebSocketService
 import org.jitsi.videobridge.xmpp.XmppConnection
 import org.jitsi.videobridge.xmpp.config.XmppClientConnectionConfig
-import org.jxmpp.stringprep.XmppStringPrepUtil
+import sun.misc.Signal
 import java.time.Clock
 import kotlin.concurrent.thread
-import org.jitsi.videobridge.octo.singleton as octoRelayService
+import kotlin.system.exitProcess
 import org.jitsi.videobridge.websocket.singleton as webSocketServiceSingleton
 
-fun main(args: Array<String>) {
+fun main() {
     val logger = LoggerImpl("org.jitsi.videobridge.Main")
 
-    // We only support command line arguments for backward compatibility. The --apis options is the last one supported,
-    // and it is only used to enable/disable the REST API (XMPP is only controlled through the config files).
-    // TODO: fully remove support for --apis
-    CmdLine().apply {
-        parse(args)
-        getOptionValue("--apis")?.let {
-            logger.warn(
-                "A deprecated command line argument (--apis) is present. Please use the config file to control the " +
-                    "REST API instead (see rest.md). Support for --apis will be removed in a future version."
-            )
-            System.setProperty(
-                Videobridge.REST_API_PNAME,
-                it.contains(Videobridge.REST_API).toString()
-            )
-        }
+    Thread.setDefaultUncaughtExceptionHandler { thread, exception ->
+        logger.error("An uncaught exception occurred in thread=$thread", exception)
     }
 
     setupMetaconfigLogger()
@@ -82,45 +73,53 @@ fun main(args: Array<String>) {
     //  to be passed.
     System.setProperty("org.eclipse.jetty.util.log.class", "org.eclipse.jetty.util.log.JavaUtilLog")
 
+    Metrics.start()
+
     // Reload the Typesafe config used by ice4j, because the original was initialized before the new system
     // properties were set.
     JitsiConfig.reloadNewConfig()
 
-    val versionService = JvbVersionService().also {
-        logger.info("Starting jitsi-videobridge version ${it.currentVersion}")
-    }
+    logger.info("Starting jitsi-videobridge version ${JvbVersionService.instance.currentVersion}")
 
+    UlimitCheck.printUlimits()
     startIce4j()
 
-    XmppStringPrepUtil.setMaxCacheSizes(XmppClientConnectionConfig.config.jidCacheSize)
+    setupBufferPools()
+
+    // Initialize, binding on the main ICE port.
+    Harvesters.init()
+
+    org.jitsi.videobridge.xmpp.Smack.initialize()
     PacketQueue.setEnableStatisticsDefault(true)
+
+    // Trigger an exception early in case the DTLS cipher suites are misconfigured
+    try {
+        DtlsConfig.config.cipherSuites
+    } catch (ce: ConfigException) {
+        logger.error("Dtls configuration error: $ce")
+        // According to https://freedesktop.org/software/systemd/man/systemd.exec…html#Process%20Exit%20Code
+        // 78 means "configuration error"
+        exitProcess(78)
+    }
 
     val xmppConnection = XmppConnection().apply { start() }
     val shutdownService = ShutdownServiceImpl()
     val videobridge = Videobridge(
-        xmppConnection, shutdownService, versionService.currentVersion, VersionConfig.config.release, Clock.systemUTC()
-    ).apply { start() }
+        xmppConnection,
+        shutdownService,
+        JvbVersionService.instance.currentVersion,
+        Clock.systemUTC()
+    )
+    val videobridgeExpireThread = VideobridgeExpireThread(videobridge).apply { start() }
+    Metrics.metricsUpdater.addUpdateTask {
+        VideobridgePeriodicMetrics.update(videobridge)
+    }
     val healthChecker = videobridge.jvbHealthChecker
-    val octoRelayService = octoRelayService().get()?.apply { start() }
-    val statsCollector = StatsCollector(VideobridgeStatistics(videobridge, octoRelayService, xmppConnection)).apply {
-        start()
-        addTransport(MucStatsTransport(xmppConnection), XmppClientConnectionConfig.config.presenceInterval.toMillis())
-    }
-
-    val callstats = if (CallstatsConfig.config.enabled) {
-        CallstatsService(videobridge.version).apply {
-            start {
-                statsTransport?.let { statsTransport ->
-                    statsCollector.addTransport(statsTransport, CallstatsConfig.config.interval.toMillis())
-                } ?: throw IllegalStateException("Stats transport is null after the service is started")
-
-                videobridge.addEventHandler(videobridgeEventHandler)
-            }
-        }
-    } else {
-        logger.info("Not starting CallstatsService, disabled in configuration.")
-        null
-    }
+    val presencePublisher = MucPublisher(
+        TaskPools.SCHEDULED_POOL,
+        XmppClientConnectionConfig.config.presenceInterval,
+        xmppConnection
+    ).apply { start() }
 
     val publicServerConfig = JettyBundleActivatorConfig(
         "org.jitsi.videobridge.rest",
@@ -149,8 +148,7 @@ fun main(args: Array<String>) {
         val restApp = Application(
             videobridge,
             xmppConnection,
-            statsCollector,
-            versionService.currentVersion,
+            JvbVersionService.instance.currentVersion,
             healthChecker
         )
         createServer(privateServerConfig).also {
@@ -166,21 +164,30 @@ fun main(args: Array<String>) {
         null
     }
 
+    var exitStatus = 0
+
+    /* Catch signals and cause them to trigger a clean shutdown. */
+    listOf("TERM", "HUP", "INT").forEach { signalName ->
+        try {
+            Signal.handle(Signal(signalName)) { signal ->
+                exitStatus = signal.number + 128 // Matches java.lang.Terminator
+                logger.info("Caught signal $signal, shutting down.")
+
+                shutdownService.beginShutdown()
+            }
+        } catch (e: IllegalArgumentException) {
+            /* Unknown signal on this platform, or not allowed to register this signal; that's fine. */
+            logger.warn("Unable to register signal '$signalName'", e)
+        }
+    }
+
     // Block here until the bridge shuts down
     shutdownService.waitForShutdown()
 
     logger.info("Bridge shutting down")
     healthChecker.stop()
-    octoRelayService?.stop()
+    presencePublisher.stop()
     xmppConnection.stop()
-    callstats?.let {
-        videobridge.removeEventHandler(it.videobridgeEventHandler)
-        it.statsTransport?.let { statsTransport ->
-            statsCollector.removeTransport(statsTransport)
-        }
-        it.stop()
-    }
-    statsCollector.stop()
 
     try {
         publicHttpServer?.stop()
@@ -188,12 +195,16 @@ fun main(args: Array<String>) {
     } catch (t: Throwable) {
         logger.error("Error shutting down http servers", t)
     }
+    videobridgeExpireThread.stop()
     videobridge.stop()
     stopIce4j()
+    Metrics.stop()
 
     TaskPools.SCHEDULED_POOL.shutdownNow()
     TaskPools.CPU_POOL.shutdownNow()
     TaskPools.IO_POOL.shutdownNow()
+
+    exitProcess(exitStatus)
 }
 
 private fun setupMetaconfigLogger() {
@@ -217,7 +228,6 @@ private fun setSystemPropertyDefaults() {
 
 private fun getSystemPropertyDefaults(): Map<String, String> {
     val defaults = mutableMapOf<String, String>()
-    Utils.getCallStatsJavaSDKSystemPropertyDefaults(defaults)
 
     // Make legacy ice4j properties system properties.
     val cfg = JitsiConfig.SipCommunicatorProps
@@ -232,6 +242,7 @@ private fun getSystemPropertyDefaults(): Map<String, String> {
 }
 
 private fun startIce4j() {
+    AbstractUdpListener.USE_PUSH_API = true
     // Start the initialization of the mapping candidate harvesters.
     // Asynchronous, because the AWS and STUN harvester may take a long
     // time to initialize.
@@ -242,5 +253,22 @@ private fun startIce4j() {
 
 private fun stopIce4j() {
     // Shut down harvesters.
-    Harvesters.closeStaticConfiguration()
+    Harvesters.close()
+}
+
+/** Configure our libraries to use JVB's global [ByteBufferPool] */
+private fun setupBufferPools() {
+    org.jitsi.rtp.util.BufferPool.getArray = { ByteBufferPool.getBuffer(it) }
+    org.jitsi.rtp.util.BufferPool.returnArray = { ByteBufferPool.returnBuffer(it) }
+    org.jitsi.nlj.util.BufferPool.getBuffer = { ByteBufferPool.getBuffer(it) }
+    org.jitsi.nlj.util.BufferPool.returnBuffer = { ByteBufferPool.returnBuffer(it) }
+    org.ice4j.util.BufferPool.getBuffer = { len ->
+        val b = ByteBufferPool.getBuffer(len)
+        Buffer(b, 0, b.size)
+    }
+    org.ice4j.util.BufferPool.returnBuffer = { ByteBufferPool.returnBuffer(it.buffer) }
+    org.ice4j.ice.harvest.AbstractUdpListener.BYTES_TO_LEAVE_AT_START_OF_PACKET =
+        RtpPacket.BYTES_TO_LEAVE_AT_START_OF_PACKET
+    org.ice4j.ice.harvest.AbstractUdpListener.BYTES_TO_LEAVE_AT_END_OF_PACKET =
+        Packet.BYTES_TO_LEAVE_AT_END_OF_PACKET
 }

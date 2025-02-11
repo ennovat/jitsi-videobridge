@@ -17,41 +17,43 @@ package org.jitsi.videobridge.relay
 
 import org.eclipse.jetty.websocket.client.ClientUpgradeRequest
 import org.eclipse.jetty.websocket.client.WebSocketClient
+import org.eclipse.jetty.websocket.core.CloseStatus
 import org.jitsi.utils.logging2.Logger
 import org.jitsi.videobridge.AbstractEndpointMessageTransport
-import org.jitsi.videobridge.MultiStreamConfig
 import org.jitsi.videobridge.VersionConfig
-import org.jitsi.videobridge.Videobridge
+import org.jitsi.videobridge.datachannel.DataChannel
+import org.jitsi.videobridge.datachannel.DataChannelStack.DataChannelMessageListener
+import org.jitsi.videobridge.datachannel.protocol.DataChannelMessage
+import org.jitsi.videobridge.datachannel.protocol.DataChannelStringMessage
 import org.jitsi.videobridge.message.AddReceiverMessage
 import org.jitsi.videobridge.message.BridgeChannelMessage
 import org.jitsi.videobridge.message.ClientHelloMessage
 import org.jitsi.videobridge.message.EndpointConnectionStatusMessage
 import org.jitsi.videobridge.message.EndpointMessage
 import org.jitsi.videobridge.message.EndpointStats
-import org.jitsi.videobridge.message.SelectedEndpointMessage
-import org.jitsi.videobridge.message.SelectedEndpointsMessage
 import org.jitsi.videobridge.message.ServerHelloMessage
 import org.jitsi.videobridge.message.SourceVideoTypeMessage
 import org.jitsi.videobridge.message.VideoTypeMessage
-import org.jitsi.videobridge.util.TaskPools
+import org.jitsi.videobridge.metrics.VideobridgeMetrics
 import org.jitsi.videobridge.websocket.ColibriWebSocket
+import org.jitsi.videobridge.websocket.config.WebsocketServiceConfig
 import org.json.simple.JSONObject
+import java.lang.ref.WeakReference
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
-import java.util.function.Supplier
 
 /**
  * Handles the functionality related to sending and receiving COLIBRI messages
- * for a [Relay].
+ * for a [Relay]. Supports two underlying transport mechanisms --
+ * WebRTC data channels and {@code WebSocket}s.
  */
 class RelayMessageTransport(
     private val relay: Relay,
-    private val statisticsSupplier: Supplier<Videobridge.Statistics>,
     private val eventHandler: EndpointMessageTransportEventHandler,
     parentLogger: Logger
-) : AbstractEndpointMessageTransport(parentLogger), ColibriWebSocket.EventHandler {
+) : AbstractEndpointMessageTransport(parentLogger), ColibriWebSocket.EventHandler, DataChannelMessageListener {
     /**
      * The last connected/accepted web-socket by this instance, if any.
      */
@@ -63,14 +65,19 @@ class RelayMessageTransport(
     private var url: String? = null
 
     /**
-     * An active websocket client.
-     */
-    private var outgoingWebsocket: WebSocketClient? = null
-
-    /**
      * Use to synchronize access to [webSocket]
      */
     private val webSocketSyncRoot = Any()
+
+    /**
+     * Whether the last active transport channel (i.e. the last to receive a
+     * message from the remote endpoint) was the web socket (if `true`),
+     * or the WebRTC data channel (if `false`).
+     */
+    private var webSocketLastActive = false
+
+    private var dataChannel = WeakReference<DataChannel>(null)
+
     private val numOutgoingMessagesDropped = AtomicInteger(0)
 
     /**
@@ -78,12 +85,10 @@ class RelayMessageTransport(
      */
     private val sentMessagesCounts: MutableMap<String, AtomicLong> = ConcurrentHashMap()
 
-    init { logger.addContext("relay-id", relay.id) }
-
     /**
      * Connect the bridge channel message to the websocket URL specified
      */
-    fun connectTo(url: String) {
+    fun connectToWebsocket(url: String) {
         if (this.url != null && this.url == url) {
             return
         }
@@ -100,15 +105,11 @@ class RelayMessageTransport(
             webSocket = null
         }
 
-        // this.webSocket should only be initialized when it has connected (via [webSocketConnected]).
-        val newWebSocket = ColibriWebSocket(relay.id, this)
-        outgoingWebsocket?.let {
-            logger.warn("Re-connecting while outgoingWebsocket != null, possible leak.")
-            it.stop()
-        }
-        outgoingWebsocket = WebSocketClient().also {
-            it.start()
-            it.connect(newWebSocket, URI(url), ClientUpgradeRequest())
+        ColibriWebSocket(relay.id, this).also {
+            webSocketClient.connect(it, URI(url), ClientUpgradeRequest())
+            synchronized(webSocketSyncRoot) {
+                webSocket = it
+            }
         }
     }
 
@@ -151,60 +152,25 @@ class RelayMessageTransport(
      * @return
      */
     override fun addReceiver(message: AddReceiverMessage): BridgeChannelMessage? {
-        if (MultiStreamConfig.config.enabled) {
-            val sourceName = message.sourceName ?: run {
-                logger.error("Received AddReceiverMessage for with sourceName = null")
-                return null
-            }
-            val ep = relay.conference.findSourceOwner(sourceName) ?: run {
-                logger.warn("Received AddReceiverMessage for unknown or non-local: $sourceName")
-                return null
-            }
-
-            ep.addReceiverV2(relay.id, sourceName, message.videoConstraints)
-        } else {
-            val epId = message.endpointId
-            val ep = relay.conference.getLocalEndpoint(epId) ?: run {
-                logger.warn("Received AddReceiverMessage for unknown or non-local epId $epId")
-                return null
-            }
-
-            ep.addReceiver(relay.id, message.videoConstraints)
+        val sourceName = message.sourceName ?: run {
+            logger.error("Received AddReceiverMessage for with sourceName = null")
+            return null
         }
+        val ep = relay.conference.findSourceOwner(sourceName) ?: run {
+            logger.warn("Received AddReceiverMessage for unknown or non-local: $sourceName")
+            return null
+        }
+
+        ep.addReceiver(relay.id, sourceName, message.videoConstraints)
         return null
     }
 
     override fun videoType(message: VideoTypeMessage): BridgeChannelMessage? {
-        val epId = message.endpointId
-        if (epId == null) {
-            logger.warn("Received VideoTypeMessage over relay channel with no endpoint ID")
-            return null
-        }
-
-        if (MultiStreamConfig.config.enabled) {
-            logger.error("Relay: unexpected video type message while in the multi-stream mode, eId=$epId")
-            return null
-        }
-
-        val ep = relay.getEndpoint(epId)
-
-        if (ep == null) {
-            logger.warn("Received VideoTypeMessage for unknown epId $epId")
-            return null
-        }
-
-        ep.setVideoType(message.videoType)
-
-        relay.conference.sendMessageFromRelay(message, false, relay.meshId)
-
+        logger.error("Relay: unexpected video type message: ${message.toJson()}")
         return null
     }
 
     override fun sourceVideoType(message: SourceVideoTypeMessage): BridgeChannelMessage? {
-        if (!MultiStreamConfig.config.enabled) {
-            return null
-        }
-
         val epId = message.endpointId
         if (epId == null) {
             logger.warn("Received SourceVideoTypeMessage over relay channel with no endpoint ID")
@@ -226,7 +192,7 @@ class RelayMessageTransport(
     }
 
     override fun unhandledMessage(message: BridgeChannelMessage) {
-        logger.warn("Received a message with an unexpected type: " + message.type)
+        logger.warn("Received a message with an unexpected type: ${message.javaClass.simpleName}")
     }
 
     /**
@@ -238,9 +204,21 @@ class RelayMessageTransport(
         super.sendMessage(dst, message) // Log message
         if (dst is ColibriWebSocket) {
             sendMessage(dst, message)
+        } else if (dst is DataChannel) {
+            sendMessage(dst, message)
         } else {
             throw IllegalArgumentException("unknown transport:$dst")
         }
+    }
+
+    /**
+     * Sends a string via a particular [DataChannel].
+     * @param dst the data channel to send through.
+     * @param message the message to send.
+     */
+    private fun sendMessage(dst: DataChannel, message: BridgeChannelMessage) {
+        dst.sendString(message.toJson())
+        VideobridgeMetrics.dataChannelMessagesSent.inc()
     }
 
     /**
@@ -249,31 +227,76 @@ class RelayMessageTransport(
      * @param message the message to send.
      */
     private fun sendMessage(dst: ColibriWebSocket, message: BridgeChannelMessage) {
-        // We'll use the async version of sendString since this may be called
-        // from multiple threads.  It's just fire-and-forget though, so we
-        // don't wait on the result
-        dst.remote?.sendStringByFuture(message.toJson())
-        statisticsSupplier.get().totalColibriWebSocketMessagesSent.incrementAndGet()
+        dst.sendString(message.toJson())
+        VideobridgeMetrics.colibriWebSocketMessagesSent.inc()
+    }
+
+    override fun onDataChannelMessage(dataChannelMessage: DataChannelMessage?) {
+        webSocketLastActive = false
+        VideobridgeMetrics.dataChannelMessagesReceived.inc()
+        if (dataChannelMessage is DataChannelStringMessage) {
+            onMessage(dataChannel.get(), dataChannelMessage.data)
+        }
     }
 
     /**
      * {@inheritDoc}
      */
     public override fun sendMessage(msg: BridgeChannelMessage) {
-        if (webSocket == null) {
+        val dst = getActiveTransportChannel()
+        if (dst == null) {
             logger.debug("No available transport channel, can't send a message")
             numOutgoingMessagesDropped.incrementAndGet()
         } else {
             sentMessagesCounts.computeIfAbsent(msg.javaClass.simpleName) { AtomicLong() }.incrementAndGet()
-            sendMessage(webSocket, msg)
+            sendMessage(dst, msg)
         }
     }
 
+    /**
+     * @return the active transport channel for this
+     * [RelayMessageTransport] (either the [.webSocket], or
+     * the WebRTC data channel represented by a [DataChannel]).
+     *
+     * The "active" channel is determined based on what channels are available,
+     * and which one was the last to receive data. That is, if only one channel
+     * is available, it will be returned. If two channels are available, the
+     * last one to have received data will be returned. Otherwise, `null`
+     * will be returned.
+     */
+    // TODO(brian): seems like it'd be nice to have the websocket and datachannel
+    // share a common parent class (or, at least, have a class that is returned
+    // here and provides a common API but can wrap either a websocket or
+    // datachannel)
+    private fun getActiveTransportChannel(): Any? {
+        val dataChannel = dataChannel.get()
+        val webSocket = webSocket
+        var dst: Any? = null
+        if (webSocketLastActive) {
+            dst = webSocket
+        }
+
+        // Either the socket was not the last active channel,
+        // or it has been closed.
+        if (dst == null) {
+            if (dataChannel != null && dataChannel.isReady) {
+                dst = dataChannel
+            }
+        }
+
+        // Maybe the WebRTC data channel is the last active, but it is not
+        // currently available. If so, and a web-socket is available -- use it.
+        if (dst == null && webSocket != null) {
+            dst = webSocket
+        }
+        return dst
+    }
+
     override val isConnected: Boolean
-        get() = webSocket != null
+        get() = getActiveTransportChannel() != null
 
     val isActive: Boolean
-        get() = outgoingWebsocket != null
+        get() = url != null
 
     /**
      * {@inheritDoc}
@@ -282,8 +305,11 @@ class RelayMessageTransport(
         synchronized(webSocketSyncRoot) {
             // If we already have a web-socket, discard it and use the new one.
             if (ws != webSocket) {
-                logger.info("Replacing an existing websocket.")
-                webSocket?.session?.close(200, "replaced")
+                if (webSocket != null) {
+                    logger.info("Replacing an existing websocket.")
+                    webSocket?.session?.close(CloseStatus.NORMAL, "replaced")
+                }
+                webSocketLastActive = true
                 webSocket = ws
                 sendMessage(ws, createServerHello())
             } else {
@@ -312,15 +338,28 @@ class RelayMessageTransport(
         synchronized(webSocketSyncRoot) {
             if (ws == webSocket) {
                 webSocket = null
+                webSocketLastActive = false
                 logger.debug { "Web socket closed, statusCode $statusCode ( $reason)." }
+                // 1000 is normal, 1001 is e.g. a tab closing. 1005 is "No Status Rcvd" and we see the majority of
+                // sockets close this way.
+                if (statusCode == 1000 || statusCode == 1001 || statusCode == 1005) {
+                    VideobridgeMetrics.colibriWebSocketCloseNormal.inc()
+                } else {
+                    VideobridgeMetrics.colibriWebSocketCloseAbnormal.inc()
+                }
             }
         }
-        outgoingWebsocket?.let {
-            // Try to reconnect.  TODO: how to handle failures?
-            it.stop()
-            outgoingWebsocket = null
+
+        // This check avoids trying to establish a new WS when the closing of the existing WS races the signaling to
+        // expire the relay. 1001 with RELAY_CLOSED means that the remote side willingly closed the socket.
+        if (statusCode != 1001 || reason != RELAY_CLOSED) {
             doConnect()
         }
+    }
+
+    override fun webSocketError(ws: ColibriWebSocket, cause: Throwable) {
+        logger.error("Colibri websocket error: ${cause.message}")
+        VideobridgeMetrics.colibriWebSocketErrors.inc()
     }
 
     /**
@@ -331,22 +370,11 @@ class RelayMessageTransport(
             if (webSocket != null) {
                 // 410 Gone indicates that the resource requested is no longer
                 // available and will not be available again.
-                webSocket?.session?.close(410, "replaced")
+                webSocket?.session?.close(CloseStatus.SHUTDOWN, RELAY_CLOSED)
                 webSocket = null
                 logger.debug { "Relay expired, closed colibri web-socket." }
             }
         }
-        outgoingWebsocket?.let {
-            // Stopping might block and we don't want to hold the thread processing signaling.
-            TaskPools.IO_POOL.submit {
-                try {
-                    it.stop()
-                } catch (e: Exception) {
-                    logger.warn("Error while stopping outgoing web socket", e)
-                }
-            }
-        }
-        outgoingWebsocket = null
     }
 
     /**
@@ -357,8 +385,34 @@ class RelayMessageTransport(
             logger.warn("Received text from an unknown web socket.")
             return
         }
-        statisticsSupplier.get().totalColibriWebSocketMessagesReceived.incrementAndGet()
+        VideobridgeMetrics.colibriWebSocketMessagesReceived.inc()
+        webSocketLastActive = true
         onMessage(ws, message)
+    }
+
+    /**
+     * Sets the data channel for this endpoint.
+     * @param dataChannel the [DataChannel] to use for this transport
+     */
+    fun setDataChannel(dataChannel: DataChannel) {
+        val prevDataChannel = this.dataChannel.get()
+        if (prevDataChannel == null) {
+            this.dataChannel = WeakReference(dataChannel)
+            // We install the handler first, otherwise the 'ready' might fire after we check it but before we
+            //  install the handler
+            dataChannel.onDataChannelEvents { notifyTransportChannelConnected() }
+            if (dataChannel.isReady) {
+                notifyTransportChannelConnected()
+            }
+            dataChannel.onDataChannelMessage(this)
+        } else if (prevDataChannel === dataChannel) {
+            // TODO: i think we should be able to ensure this doesn't happen,
+            // so throwing for now.  if there's a good
+            // reason for this, we can make this a no-op
+            throw Error("Re-setting the same data channel")
+        } else {
+            throw Error("Overwriting a previous data channel!")
+        }
     }
 
     override val debugState: JSONObject
@@ -370,21 +424,6 @@ class RelayMessageTransport(
             debugState["sent_counts"] = sentCounts
             return debugState
         }
-
-    /**
-     * Notifies this `Endpoint` that a [SelectedEndpointsMessage]
-     * has been received.
-     *
-     * @param message the message that was received.
-     */
-    override fun selectedEndpoint(message: SelectedEndpointMessage): BridgeChannelMessage? {
-        val newSelectedEndpointID = message.selectedEndpoint
-        val newSelectedIDs: List<String> =
-            if (newSelectedEndpointID == null || newSelectedEndpointID.isBlank()) emptyList()
-            else listOf(newSelectedEndpointID)
-        selectedEndpoints(SelectedEndpointsMessage(newSelectedIDs))
-        return null
-    }
 
     /**
      * Handles an opaque message received on the Relay channel. The message originates from an endpoint with an ID of
@@ -410,13 +449,18 @@ class RelayMessageTransport(
                 return null
             }
 
-            conference.sendMessage(message, listOf(targetEndpoint), false /* sendToOcto */)
+            conference.sendMessage(
+                message,
+                listOf(targetEndpoint),
+                // sendToRelays
+                false
+            )
         }
         return null
     }
 
     /**
-     * Handles an endpoint statistics message on the Octo channel that should be forwarded to
+     * Handles an endpoint statistics message on the Relay channel that should be forwarded to
      * local endpoints as appropriate.
      *
      * @param message the message that was received from the endpoint.
@@ -450,5 +494,20 @@ class RelayMessageTransport(
         }
         conference.sendMessageFromRelay(message, true, relay.meshId)
         return null
+    }
+
+    companion object {
+        /**
+         * The single [WebSocketClient] instance that all [Relay]s use to initiate a web socket connection.
+         */
+        val webSocketClient = WebSocketClient().apply {
+            idleTimeout = WebsocketServiceConfig.config.idleTimeout
+            start()
+        }
+
+        /**
+         * Reason to use when closing a WS due to the relay being expired.
+         */
+        const val RELAY_CLOSED = "relay_closed"
     }
 }

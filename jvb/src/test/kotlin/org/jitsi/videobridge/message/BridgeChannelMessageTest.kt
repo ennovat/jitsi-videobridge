@@ -15,6 +15,7 @@
  */
 package org.jitsi.videobridge.message
 
+import com.fasterxml.jackson.core.JsonParseException
 import com.fasterxml.jackson.core.JsonProcessingException
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.exc.InvalidTypeIdException
@@ -30,7 +31,6 @@ import io.kotest.matchers.types.shouldBeInstanceOf
 import org.jitsi.nlj.VideoType
 import org.jitsi.videobridge.cc.allocation.VideoConstraints
 import org.jitsi.videobridge.message.BridgeChannelMessage.Companion.parse
-import org.json.simple.JSONArray
 import org.json.simple.JSONObject
 import org.json.simple.parser.JSONParser
 
@@ -46,25 +46,7 @@ class BridgeChannelMessageTest : ShouldSpec() {
                 parsed.shouldBeInstanceOf<JSONObject>()
                 val parsedColibriClass = parsed["colibriClass"]
                 parsedColibriClass.shouldBeInstanceOf<String>()
-                parsedColibriClass shouldBe message.type
-            }
-        }
-        context("parsing and serializing a SelectedEndpointsChangedEvent message") {
-            val parsed = parse(SELECTED_ENDPOINTS_MESSAGE)
-            should("parse to the correct type") {
-                parsed.shouldBeInstanceOf<SelectedEndpointsMessage>()
-            }
-            should("parse the list of endpoints correctly") {
-                parsed as SelectedEndpointsMessage
-                parsed.selectedEndpoints shouldBe listOf("abcdabcd", "12341234")
-            }
-
-            should("serialize and de-serialize correctly") {
-                val selectedEndpoints = listOf("abcdabcd", "12341234")
-                val serialized = SelectedEndpointsMessage(selectedEndpoints).toJson()
-                val parsed2 = parse(serialized)
-                parsed2.shouldBeInstanceOf<SelectedEndpointsMessage>()
-                parsed2.selectedEndpoints shouldBe selectedEndpoints
+                parsedColibriClass shouldBe ClientHelloMessage.TYPE
             }
         }
         context("parsing an invalid message") {
@@ -83,13 +65,58 @@ class BridgeChannelMessageTest : ShouldSpec() {
             shouldThrow<InvalidTypeIdException> {
                 parse("""{"colibriClass": "invalid-colibri-class" }""")
             }
+            shouldThrow<JsonParseException> {
+                parse(
+                    """
+                {
+                  "colibriClass": "EndpointStats",
+                  "colibriClass": "duplicate"
+                }
+                    """.trimIndent()
+                )
+            }
+            shouldThrow<JsonParseException> {
+                parse(
+                    """
+                {
+                  "colibriClass": "EndpointStats",
+                  "to": "a",
+                  "to": "b"
+                }
+                    """.trimIndent()
+                )
+            }
+            shouldThrow<JsonParseException> {
+                parse(
+                    """
+                {
+                  "colibriClass": "EndpointStats",
+                  "from": "a",
+                  "from": "b"
+                }
+                    """.trimIndent()
+                )
+            }
+            shouldThrow<JsonParseException> {
+                parse(
+                    """
+                {
+                  "colibriClass": "EndpointStats",
+                  "non-defined-prop": "a",
+                  "non-defined-prop": "b"
+                }
+                    """.trimIndent()
+                )
+            }
 
             context("when some of the message-specific fields are missing/invalid") {
                 shouldThrow<JsonProcessingException> {
-                    parse("""{"colibriClass": "SelectedEndpointsChangedEvent" }""")
+                    // Missing dominantSpeakerEndpoint field
+                    parse("""{"colibriClass": "DominantSpeakerEndpointChangeEvent" }""")
                 }
                 shouldThrow<JsonProcessingException> {
-                    parse("""{"colibriClass": "SelectedEndpointsChangedEvent", "selectedEndpoints": 5 }""")
+                    // dominantSpeakerEndpoint has the wrong type
+                    parse("""{"colibriClass": "DominantSpeakerEndpointChangeEvent", "dominantSpeakerEndpoint": [5] }""")
                 }
             }
         }
@@ -97,6 +124,7 @@ class BridgeChannelMessageTest : ShouldSpec() {
             val endpointsMessage = EndpointMessage("to_value")
             endpointsMessage.otherFields["other_field1"] = "other_value1"
             endpointsMessage.put("other_field2", 97)
+            endpointsMessage.put("other_null", null)
 
             val json = endpointsMessage.toJson()
             // Make sure we don't mistakenly serialize the "broadcast" flag.
@@ -112,6 +140,9 @@ class BridgeChannelMessageTest : ShouldSpec() {
             parsed.to shouldBe "to_value"
             parsed.otherFields["other_field1"] shouldBe "other_value1"
             parsed.otherFields["other_field2"] shouldBe 97
+            parsed.otherFields["other_null"] shouldBe null
+            parsed.otherFields.containsKey("other_null") shouldBe true
+            parsed.otherFields.containsKey("nonexistent") shouldBe false
 
             endpointsMessage.from = "new"
             (parse(endpointsMessage.toJson()) as EndpointMessage).from shouldBe "new"
@@ -123,6 +154,8 @@ class BridgeChannelMessageTest : ShouldSpec() {
                 parsed2.to shouldBe "to_value"
                 parsed2.otherFields["other_field1"] shouldBe "other_value1"
                 parsed2.otherFields["other_field2"] shouldBe 97
+                parsed2.otherFields.containsKey("other_null") shouldBe true
+                parsed2.otherFields.containsKey("nonexistent") shouldBe false
             }
         }
 
@@ -167,24 +200,6 @@ class BridgeChannelMessageTest : ShouldSpec() {
             parsed.active shouldBe "true"
         }
 
-        context("serializing and parsing ForwardedEndpointsMessage") {
-            val forwardedEndpoints = setOf("a", "b", "c")
-
-            val message = ForwardedEndpointsMessage(forwardedEndpoints)
-            val parsed = parse(message.toJson())
-
-            parsed.shouldBeInstanceOf<ForwardedEndpointsMessage>()
-
-            parsed.forwardedEndpoints shouldContainExactly forwardedEndpoints
-
-            // Make sure the forwardedEndpoints field is serialized as lastNEndpoints as the client (presumably) expects
-            val parsedJson = JSONParser().parse(message.toJson())
-            parsedJson.shouldBeInstanceOf<JSONObject>()
-            val parsedForwardedEndpoints = parsedJson["lastNEndpoints"]
-            parsedForwardedEndpoints.shouldBeInstanceOf<JSONArray>()
-            parsedForwardedEndpoints.toList() shouldContainExactly forwardedEndpoints
-        }
-
         context("serializing and parsing ForwardedSourcesMessage") {
             val forwardedSources = setOf("s1", "s2", "s3")
 
@@ -202,18 +217,9 @@ class BridgeChannelMessageTest : ShouldSpec() {
             videoConstraints.maxFrameRate shouldBe 15.0
         }
 
-        context("and SenderVideoConstraintsMessage") {
-            val senderVideoConstraintsMessage = SenderVideoConstraintsMessage(1080)
-            val parsed = parse(senderVideoConstraintsMessage.toJson())
-
-            parsed.shouldBeInstanceOf<SenderVideoConstraintsMessage>()
-
-            parsed.videoConstraints.idealHeight shouldBe 1080
-        }
-
         context("serializing and parsing SenderSourceConstraintsMessage") {
-            val senderVideoConstraintsMessage = SenderSourceConstraintsMessage("s1", 1080)
-            val parsed = parse(senderVideoConstraintsMessage.toJson())
+            val senderSourceConstraintsMessage = SenderSourceConstraintsMessage("s1", 1080)
+            val parsed = parse(senderSourceConstraintsMessage.toJson())
 
             parsed.shouldBeInstanceOf<SenderSourceConstraintsMessage>()
 
@@ -323,14 +329,104 @@ class BridgeChannelMessageTest : ShouldSpec() {
             }
         }
 
+        context("serializing and parsing VideoSourceMap") {
+            val source1 = "source1234"
+            val owner1 = "endpoint1"
+            val ssrc1 = 12345L
+            val rtxSsrc1 = 45678L
+
+            val source2 = "source5678"
+            val owner2 = "endpoint2"
+            val ssrc2 = 87654L
+            val rtxSsrc2 = 98765L
+
+            val videoSourcesMapMessage = VideoSourcesMap(
+                listOf(
+                    VideoSourceMapping(source1, owner1, ssrc1, rtxSsrc1, VideoType.CAMERA),
+                    VideoSourceMapping(source2, owner2, ssrc2, rtxSsrc2, VideoType.DESKTOP)
+                )
+            )
+
+            parse(videoSourcesMapMessage.toJson()).apply {
+                shouldBeInstanceOf<VideoSourcesMap>()
+                mappedSources.size shouldBe 2
+                mappedSources shouldContainExactly
+                    listOf(
+                        VideoSourceMapping(source1, owner1, ssrc1, rtxSsrc1, VideoType.CAMERA),
+                        VideoSourceMapping(source2, owner2, ssrc2, rtxSsrc2, VideoType.DESKTOP)
+                    )
+            }
+
+            val jsonString = """
+                {"colibriClass":"VideoSourcesMap",
+                 "mappedSources":[{"source":"source1234","owner":"endpoint1","ssrc":12345,"rtx":45678,"videoType":"CAMERA"},
+                                  {"source":"source5678","owner":"endpoint2","ssrc":87654,"rtx":98765,"videoType":"DESKTOP"}
+                                 ]
+                }
+            """.trimIndent()
+
+            parse(jsonString).apply {
+                shouldBeInstanceOf<VideoSourcesMap>()
+                mappedSources.size shouldBe 2
+                mappedSources shouldContainExactly
+                    listOf(
+                        VideoSourceMapping(source1, owner1, ssrc1, rtxSsrc1, VideoType.CAMERA),
+                        VideoSourceMapping(source2, owner2, ssrc2, rtxSsrc2, VideoType.DESKTOP)
+                    )
+            }
+        }
+
+        context("serializing and parsing AudioSourceMap") {
+            val source1 = "source1234-a"
+            val owner1 = "endpoint1"
+            val ssrc1 = 23456L
+
+            val source2 = "source5678-a"
+            val owner2 = "endpoint2"
+            val ssrc2 = 98765L
+
+            val audioSourcesMapMessage = AudioSourcesMap(
+                listOf(
+                    AudioSourceMapping(source1, owner1, ssrc1),
+                    AudioSourceMapping(source2, owner2, ssrc2)
+                )
+            )
+
+            parse(audioSourcesMapMessage.toJson()).apply {
+                shouldBeInstanceOf<AudioSourcesMap>()
+                mappedSources.size shouldBe 2
+                mappedSources shouldContainExactly
+                    listOf(
+                        AudioSourceMapping(source1, owner1, ssrc1),
+                        AudioSourceMapping(source2, owner2, ssrc2)
+                    )
+            }
+
+            val jsonString = """
+                {"colibriClass":"AudioSourcesMap",
+                 "mappedSources":[{"source":"source1234-a","owner":"endpoint1","ssrc":23456},
+                                  {"source":"source5678-a","owner":"endpoint2","ssrc":98765}
+                                 ]
+                }
+            """.trimIndent()
+
+            parse(jsonString).apply {
+                shouldBeInstanceOf<AudioSourcesMap>()
+                mappedSources.size shouldBe 2
+                mappedSources shouldContainExactly
+                    listOf(
+                        AudioSourceMapping(source1, owner1, ssrc1),
+                        AudioSourceMapping(source2, owner2, ssrc2)
+                    )
+            }
+        }
+
         context("Parsing ReceiverVideoConstraints") {
             context("With all fields present") {
                 val parsed = parse(RECEIVER_VIDEO_CONSTRAINTS)
 
                 parsed.shouldBeInstanceOf<ReceiverVideoConstraintsMessage>()
                 parsed.lastN shouldBe 3
-                parsed.onStageEndpoints shouldBe listOf("onstage1", "onstage2")
-                parsed.selectedEndpoints shouldBe listOf("selected1", "selected2")
                 parsed.defaultConstraints shouldBe VideoConstraints(0)
                 val constraints = parsed.constraints
                 constraints.shouldNotBeNull()
@@ -344,8 +440,6 @@ class BridgeChannelMessageTest : ShouldSpec() {
                 val parsed = parse(RECEIVER_VIDEO_CONSTRAINTS_EMPTY)
                 parsed.shouldBeInstanceOf<ReceiverVideoConstraintsMessage>()
                 parsed.lastN shouldBe null
-                parsed.onStageEndpoints shouldBe null
-                parsed.selectedEndpoints shouldBe null
                 parsed.defaultConstraints shouldBe null
                 parsed.constraints shouldBe null
             }
@@ -394,19 +488,13 @@ class BridgeChannelMessageTest : ShouldSpec() {
     }
 
     companion object {
-        const val SELECTED_ENDPOINTS_MESSAGE = """
-            {
-              "colibriClass": "SelectedEndpointsChangedEvent",
-              "selectedEndpoints": [ "abcdabcd", "12341234" ]
-            }
-        """
-
         const val ENDPOINT_MESSAGE = """
             {
               "colibriClass": "EndpointMessage",
               "to": "to_value",
               "other_field1": "other_value1",
-              "other_field2": 97
+              "other_field2": 97,
+              "other_null": null
             }
         """
 
@@ -426,8 +514,6 @@ class BridgeChannelMessageTest : ShouldSpec() {
             {
               "colibriClass": "ReceiverVideoConstraints",
               "lastN": 3,
-              "selectedEndpoints": [ "selected1", "selected2" ],
-              "onStageEndpoints": [ "onstage1", "onstage2" ],
               "defaultConstraints": { "maxHeight": 0 },
               "constraints": {
                 "epOnStage": { "maxHeight": 720 },

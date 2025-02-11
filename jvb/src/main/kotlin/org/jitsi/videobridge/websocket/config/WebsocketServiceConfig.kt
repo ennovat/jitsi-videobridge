@@ -19,6 +19,7 @@ package org.jitsi.videobridge.websocket.config
 import org.jitsi.config.JitsiConfig
 import org.jitsi.metaconfig.config
 import org.jitsi.metaconfig.optionalconfig
+import java.time.Duration
 
 class WebsocketServiceConfig private constructor() {
     /**
@@ -32,15 +33,55 @@ class WebsocketServiceConfig private constructor() {
         "videobridge.websockets.enabled".from(JitsiConfig.newConfig)
     }
 
-    /**
-     * The domain name used in URLs advertised for COLIBRI WebSockets.
-     */
-    val domain: String by config {
-        onlyIf("Websockets are enabled", ::enabled) {
-            "org.jitsi.videobridge.rest.COLIBRI_WS_DOMAIN".from(JitsiConfig.legacyConfig)
-            "videobridge.websockets.domain".from(JitsiConfig.newConfig)
-        }
+    private val domainProp: String? by optionalconfig {
+        "org.jitsi.videobridge.rest.COLIBRI_WS_DOMAIN".from(JitsiConfig.legacyConfig)
+        "videobridge.websockets.domain".from(JitsiConfig.newConfig)
     }
+
+    private val domainsProp: List<String> by config {
+        "videobridge.websockets.domains".from(JitsiConfig.newConfig)
+    }
+
+    /**
+     * The list of domains to advertise (advertise a separate URL for each domain).
+     * Constructed at get() time to allow underlying config changes.
+     */
+    val domains: List<String>
+        get() = domainsProp.toMutableList().apply {
+            domainProp?.let {
+                if (!contains(it)) {
+                    add(0, it)
+                }
+            }
+        }
+
+    private val relayDomainProp: String? by optionalconfig {
+        "videobridge.websockets.relay-domain".from(JitsiConfig.newConfig)
+    }
+
+    private val relayDomainsProp: List<String> by config {
+        "videobridge.websockets.relay-domains".from(JitsiConfig.newConfig)
+    }
+
+    /**
+     * The list of domains to advertise (advertise a separate URL for each domain) for relays.
+     * Constructed at get() time to allow underlying config changes.
+     */
+    val relayDomains: List<String>
+        get() {
+            val relayDomainProp = relayDomainProp
+            return if (relayDomainProp != null) {
+                relayDomainsProp.toMutableList().apply {
+                    if (!contains(relayDomainProp)) {
+                        add(0, relayDomainProp)
+                    }
+                }
+            } else if (relayDomainsProp.isNotEmpty()) {
+                relayDomainsProp.toList()
+            } else {
+                domains
+            }
+        }
 
     /**
      * Whether the "wss" or "ws" protocol should be used for websockets
@@ -71,6 +112,21 @@ class WebsocketServiceConfig private constructor() {
             "org.jitsi.videobridge.rest.COLIBRI_WS_SERVER_ID".from(JitsiConfig.legacyConfig)
             "videobridge.websockets.server-id".from(JitsiConfig.newConfig)
         }
+    }
+
+    /** Whether keepalive pings are enabled */
+    val sendKeepalivePings: Boolean by config {
+        "videobridge.websockets.send-keepalive-pings".from(JitsiConfig.newConfig)
+    }
+
+    /** The time interval for keepalive pings */
+    val keepalivePingInterval: Duration by config {
+        "videobridge.websockets.keepalive-ping-interval".from(JitsiConfig.newConfig)
+    }
+
+    /** The time interval for websocket timeouts */
+    val idleTimeout: Duration by config {
+        "videobridge.websockets.idle-timeout".from(JitsiConfig.newConfig)
     }
 
     companion object {

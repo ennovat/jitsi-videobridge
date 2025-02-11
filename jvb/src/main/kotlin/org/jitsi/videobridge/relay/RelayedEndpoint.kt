@@ -23,6 +23,7 @@ import org.jitsi.nlj.RtpReceiverEventHandler
 import org.jitsi.nlj.RtpReceiverImpl
 import org.jitsi.nlj.SetLocalSsrcEvent
 import org.jitsi.nlj.SetMediaSourcesEvent
+import org.jitsi.nlj.copy
 import org.jitsi.nlj.format.PayloadType
 import org.jitsi.nlj.rtcp.RtcpEventNotifier
 import org.jitsi.nlj.rtcp.RtcpListener
@@ -40,11 +41,8 @@ import org.jitsi.utils.logging2.Logger
 import org.jitsi.utils.logging2.cdebug
 import org.jitsi.videobridge.AbstractEndpoint
 import org.jitsi.videobridge.Conference
-import org.jitsi.videobridge.MultiStreamConfig
 import org.jitsi.videobridge.cc.allocation.VideoConstraints
 import org.jitsi.videobridge.message.AddReceiverMessage
-import org.jitsi.videobridge.octo.OctoPacketInfo
-import org.jitsi.videobridge.octo.config.OctoConfig
 import org.jitsi.videobridge.util.TaskPools
 import org.json.simple.JSONObject
 import java.time.Instant
@@ -59,7 +57,7 @@ class RelayedEndpoint(
     parentLogger: Logger,
     diagnosticContext: DiagnosticContext
 ) : AbstractEndpoint(conference, id, parentLogger), Relay.IncomingRelayPacketHandler {
-    var audioSources: Array<AudioSourceDesc> = arrayOf()
+    var audioSources: List<AudioSourceDesc> = listOf()
         set(value) {
             field = value
             value.forEach {
@@ -120,9 +118,11 @@ class RelayedEndpoint(
         return streamInformationStore.receiveSsrcs.contains(ssrc)
     }
 
-    override fun getSsrcs() = HashSet(streamInformationStore.receiveSsrcs)
+    override val ssrcs
+        get() = HashSet(streamInformationStore.receiveSsrcs)
 
-    fun hasReceiveSsrcs(): Boolean = streamInformationStore.receiveSsrcs.isNotEmpty()
+    // Visitors are never advertised between relays, so relayed endpoints are never visitors.
+    override val visitor = false
 
     /** Relayed endpoints are not automatically expired. **/
     override fun shouldExpire(): Boolean = false
@@ -131,29 +131,23 @@ class RelayedEndpoint(
 
     override fun requestKeyframe() = relay.transceiver.requestKeyFrame(mediaSource?.primarySSRC)
 
-    override fun isSendingAudio(): Boolean = rtpReceiver.isReceivingAudio()
-    override fun isSendingVideo(): Boolean = rtpReceiver.isReceivingVideo()
+    override val isSendingAudio
+        get() = rtpReceiver.isReceivingAudio()
+    override val isSendingVideo
+        get() = rtpReceiver.isReceivingVideo()
 
     override fun addPayloadType(payloadType: PayloadType) = streamInformationStore.addRtpPayloadType(payloadType)
     override fun addRtpExtension(rtpExtension: RtpExtension) =
         streamInformationStore.addRtpExtensionMapping(rtpExtension)
 
-    override fun sendVideoConstraints(maxVideoConstraints: VideoConstraints) {
-        relay.sendMessage(
-            AddReceiverMessage(
-                OctoConfig.config.relayId,
-                id,
-                null, /* source name  - used in multi-stream */
-                maxVideoConstraints
-            )
-        )
-    }
+    override fun setExtmapAllowMixed(allow: Boolean) = streamInformationStore.setExtmapAllowMixed(allow)
 
-    override fun sendVideoConstraintsV2(sourceName: String, maxVideoConstraints: VideoConstraints) {
+    override fun sendVideoConstraints(sourceName: String, maxVideoConstraints: VideoConstraints) {
         relay.sendMessage(
             AddReceiverMessage(
-                OctoConfig.config.relayId,
-                null, // Endpoint ID - will be removed
+                RelayConfig.config.relayId,
+                // Endpoint ID - will be removed
+                null,
                 sourceName,
                 maxVideoConstraints
             )
@@ -161,29 +155,22 @@ class RelayedEndpoint(
     }
 
     fun relayMessageTransportConnected() {
-        if (MultiStreamConfig.config.enabled) {
-            maxReceiverVideoConstraintsMap.forEach {
-                (sourceName, constraints) ->
-                sendVideoConstraintsV2(sourceName, constraints)
-            }
-        } else {
-            sendVideoConstraints(maxReceiverVideoConstraints)
+        maxReceiverVideoConstraints.forEach { (sourceName, constraints) ->
+            sendVideoConstraints(sourceName, constraints)
         }
     }
 
     private val _mediaSources = MediaSources()
 
-    override val mediaSource: MediaSourceDesc?
-        get() = mediaSources.getOrNull(0)
     override var mediaSources: Array<MediaSourceDesc>
         get() = _mediaSources.getMediaSources()
         set(value) {
-            if (MultiStreamConfig.config.enabled) {
-                applyVideoTypeCache(value)
-            }
+            applyVideoTypeCache(value)
             val changed = _mediaSources.setMediaSources(value)
+            val mergedMediaSources = _mediaSources.getMediaSources()
+            val signaledMediaSources = value.copy()
             if (changed) {
-                val setMediaSourcesEvent = SetMediaSourcesEvent(mediaSources)
+                val setMediaSourcesEvent = SetMediaSourcesEvent(mergedMediaSources, signaledMediaSources)
 
                 rtpReceiver.handleEvent(setMediaSourcesEvent)
                 mediaSources.forEach {
@@ -201,7 +188,7 @@ class RelayedEndpoint(
         rtpReceiver.setSrtpTransformers(srtpTransformers)
     }
 
-    override fun handleIncomingPacket(packetInfo: OctoPacketInfo) = rtpReceiver.processPacket(packetInfo)
+    override fun handleIncomingPacket(packetInfo: RelayedPacketInfo) = rtpReceiver.enqueuePacket(packetInfo)
 
     fun setFeature(feature: Features, enabled: Boolean) {
         rtpReceiver.setFeature(feature, enabled)
@@ -217,12 +204,11 @@ class RelayedEndpoint(
         }
     }
 
-    override fun getDebugState(): JSONObject {
-        return super.getDebugState().apply {
+    override val debugState: JSONObject
+        get() = super.debugState.apply {
             val block = getNodeStats()
             put(block.name, block.toJson())
         }
-    }
 
     private fun updateStatsOnExpire() {
         val relayStats = relay.statistics
@@ -238,7 +224,7 @@ class RelayedEndpoint(
     }
 
     override fun expire() {
-        if (super.isExpired()) {
+        if (super.isExpired) {
             return
         }
         super.expire()

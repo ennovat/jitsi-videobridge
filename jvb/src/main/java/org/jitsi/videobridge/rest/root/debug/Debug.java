@@ -24,6 +24,7 @@ import org.jitsi.utils.logging2.*;
 import org.jitsi.utils.logging2.Logger;
 import org.jitsi.utils.queue.*;
 import org.jitsi.videobridge.*;
+import org.jitsi.videobridge.metrics.*;
 import org.jitsi.videobridge.relay.*;
 import org.jitsi.videobridge.rest.*;
 import org.jitsi.videobridge.rest.annotations.*;
@@ -32,10 +33,12 @@ import org.jitsi.videobridge.transport.ice.*;
 import org.jitsi.videobridge.util.*;
 import org.jitsi.videobridge.xmpp.*;
 
-import javax.inject.*;
-import javax.ws.rs.*;
-import javax.ws.rs.core.*;
-import javax.ws.rs.core.MediaType;
+import jakarta.inject.*;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.*;
+import jakarta.ws.rs.core.MediaType;
+import org.json.simple.JSONObject;
+
 import java.net.*;
 
 /**
@@ -319,8 +322,13 @@ public class Debug
         OrderedJsonObject debugState = videobridge.getDebugState(null, null, full);
 
         // Append the health status.
-        Exception result = healthCheckService.getResult();
-        debugState.put("health", result == null ? "OK" : result.getMessage());
+        Result result = healthCheckService.getResult();
+        JSONObject health = new JSONObject();
+        health.put("success", result.getSuccess());
+        health.put("hardFailure", result.getHardFailure());
+        health.put("responseCode", result.getResponseCode());
+        health.put("message", result.getMessage());
+        debugState.put("health", health);
 
         return debugState.toJSONString();
     }
@@ -362,7 +370,7 @@ public class Debug
                 return ByteBufferPool.getStatsJson().toJSONString();
             }
             case QUEUE_STATS: {
-                return videobridge.getQueueStats().toJSONString();
+                return QueueStats.getQueueStats().toJSONString();
             }
             case TRANSIT_STATS: {
                 return PacketTransitStats.getStatsJson().toJSONString();
@@ -379,8 +387,11 @@ public class Debug
             case ICE_STATS: {
                 return IceStatistics.Companion.getStats().toJson().toJSONString();
             }
+            case CONFERENCE_PACKET_STATS: {
+                return ConferencePacketStats.stats.toJson().toJSONString();
+            }
             case TOSSED_PACKET_STATS: {
-                return videobridge.getStatistics().tossedPacketsEnergy.toJson().toJSONString();
+                return VideobridgeMetrics.tossedPacketsEnergy.get().toJSONString();
             }
             default: {
                 throw new NotFoundException();

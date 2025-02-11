@@ -18,11 +18,10 @@ package org.jitsi.videobridge;
 import kotlin.*;
 import org.jetbrains.annotations.*;
 import org.jitsi.nlj.*;
-import org.jitsi.nlj.rtp.*;
 import org.jitsi.rtp.Packet;
+import org.jitsi.rtp.rtcp.rtcpfb.RtcpFbPacket;
 import org.jitsi.rtp.rtcp.rtcpfb.payload_specific_fb.*;
 import org.jitsi.rtp.rtp.*;
-import org.jitsi.utils.collections.*;
 import org.jitsi.utils.dsi.*;
 import org.jitsi.utils.logging.*;
 import org.jitsi.utils.logging2.Logger;
@@ -31,12 +30,10 @@ import org.jitsi.utils.logging2.*;
 import org.jitsi.utils.queue.*;
 import org.jitsi.videobridge.colibri2.*;
 import org.jitsi.videobridge.message.*;
-import org.jitsi.videobridge.octo.*;
+import org.jitsi.videobridge.metrics.*;
 import org.jitsi.videobridge.relay.*;
-import org.jitsi.videobridge.shim.*;
 import org.jitsi.videobridge.util.*;
 import org.jitsi.videobridge.xmpp.*;
-import org.jitsi.xmpp.extensions.colibri.*;
 import org.jitsi.xmpp.extensions.colibri2.*;
 import org.jitsi.xmpp.util.*;
 import org.jivesoftware.smack.packet.*;
@@ -47,9 +44,10 @@ import java.time.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.*;
+import java.util.regex.*;
 import java.util.stream.*;
 
-import static org.jitsi.utils.collections.JMap.*;
+import static org.jitsi.xmpp.util.ErrorUtilKt.createError;
 
 /**
  * Represents a conference in the terms of Jitsi Videobridge.
@@ -62,16 +60,6 @@ import static org.jitsi.utils.collections.JMap.*;
 public class Conference
      implements AbstractEndpointMessageTransport.EndpointMessageTransportEventHandler
 {
-    /**
-     * The constant denoting that {@link #gid} is not specified.
-     */
-    public static final long GID_NOT_SET = -1;
-
-    /**
-     * The special GID value used when signaling uses colibri2. With colibri2 the GID field is not required.
-     */
-    public static final long GID_COLIBRI2 = -2;
-
     /**
      * The endpoints participating in this {@link Conference}. Although it's a
      * {@link ConcurrentHashMap}, writing to it must be protected by
@@ -86,16 +74,10 @@ public class Conference
     private final boolean isRtcStatsEnabled;
 
     /**
-     * A boolean that indicates whether or not to report to CallStats for this call.
-     */
-    private final boolean isCallStatsEnabled;
-
-    /**
      * A read-only cache of the endpoints in this conference. Note that it
-     * contains only the {@link Endpoint} instances (local endpoints, not Octo endpoints).
+     * contains only the {@link Endpoint} instances (and not {@link RelayedEndpoint}s).
      * This is because the cache was introduced for performance reasons only
-     * (we iterate over it for each RTP packet) and the Octo endpoints are not
-     * needed.
+     * (we iterate over it for each RTP packet) and the relayed endpoints are not always needed.
      */
     private List<Endpoint> endpointsCache = Collections.emptyList();
 
@@ -104,7 +86,7 @@ public class Conference
     /**
      * A map of the endpoints in this conference, by their ssrcs.
      */
-    private ConcurrentHashMap<Long, AbstractEndpoint> endpointsBySsrc = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, AbstractEndpoint> endpointsBySsrc = new ConcurrentHashMap<>();
 
     /**
      * The relays participating in this conference.
@@ -134,27 +116,8 @@ public class Conference
      * The locally unique identifier of this conference (i.e. unique across the
      * conferences on this bridge). It is locally generated and exposed via
      * colibri, and used by colibri clients to reference the conference.
-     *
-     * The current thinking is that we will phase out use of this ID (but keep
-     * it for backward compatibility) in favor of {@link #gid}.
      */
     private final String id;
-
-    /**
-     * The "global" id of this conference, selected by the controller of the
-     * bridge (e.g. jicofo). The set of controllers are responsible for making
-     * sure this ID is unique across all conferences in the system.
-     *
-     * This is not a required field unless Octo is used, and when it is not
-     * specified by the controller its value is {@link #GID_NOT_SET}.
-     *
-     * If specified, it must be a 32-bit unsigned integer (i.e. in the range
-     * [0, 0xffff_ffff]).
-     *
-     * This ID is shared between all bridges in an Octo conference, and included
-     * on-the-wire in Octo packets.
-     */
-    private final long gid;
 
     /**
      * The world readable name of this instance if any.
@@ -173,11 +136,6 @@ public class Conference
     private final Videobridge videobridge;
 
     /**
-     * Holds conference statistics.
-     */
-    private final Statistics statistics = new Statistics();
-
-    /**
      * The {@link Logger} to be used by this instance to print debug
      * information.
      */
@@ -187,12 +145,6 @@ public class Conference
      * The time when this {@link Conference} was created.
      */
     private final long creationTime = System.currentTimeMillis();
-
-    /**
-     * The shim which handles Colibri-related logic for this conference (translates colibri v1 signaling into the
-     * native videobridge APIs).
-     */
-    @NotNull private final ConferenceShim shim;
 
     /**
      * The shim which handles Colibri v2 related logic for this conference (translates colibri v2 signaling into the
@@ -208,9 +160,9 @@ public class Conference
     @NotNull private final EncodingsManager encodingsManager = new EncodingsManager();
 
     /**
-     * This {@link Conference}'s link to Octo.
+     * Cache here because it's accessed on every packet.
      */
-    private ConfOctoTransport tentacle;
+    private final boolean routeLoudestOnly = LoudestConfig.getRouteLoudestOnly();
 
     /**
      * The task of updating the ordered list of endpoints in the conference. It runs periodically in order to adapt to
@@ -229,6 +181,11 @@ public class Conference
     private final String meetingId;
 
     /**
+     * A regex pattern to trim UUIDs to just their first 8 hex characters.
+     */
+    private final static Pattern uuidTrimmer = Pattern.compile("(\\p{XDigit}{8})[\\p{XDigit}-]*");
+
+    /**
      * Initializes a new <tt>Conference</tt> instance which is to represent a
      * conference in the terms of Jitsi Videobridge which has a specific
      * (unique) ID.
@@ -237,65 +194,48 @@ public class Conference
      * <tt>Conference</tt> instance is to be initialized
      * @param id the (unique) ID of the new instance to be initialized
      * @param conferenceName world readable name of this conference
-     * @param gid the optional "global" id of the conference.
      */
     public Conference(Videobridge videobridge,
                       String id,
                       @Nullable EntityBareJid conferenceName,
-                      long gid,
                       @Nullable String meetingId,
-                      boolean isRtcStatsEnabled,
-                      boolean isCallStatsEnabled)
+                      boolean isRtcStatsEnabled)
     {
-        if (gid != GID_NOT_SET && gid != GID_COLIBRI2 &&  (gid < 0 || gid > 0xffff_ffffL))
-        {
-            throw new IllegalArgumentException("Invalid GID:" + gid);
-        }
         this.meetingId = meetingId;
         this.videobridge = Objects.requireNonNull(videobridge, "videobridge");
         this.isRtcStatsEnabled = isRtcStatsEnabled;
-        this.isCallStatsEnabled = isCallStatsEnabled;
-        Map<String, String> context = JMap.ofEntries(
-            entry("confId", id),
-            entry("gid", String.valueOf(gid))
-        );
+        Map<String, String> context = new HashMap<>(Map.of("confId", id));
         if (conferenceName != null)
         {
             context.put("conf_name", conferenceName.toString());
         }
+        if (meetingId != null)
+        {
+            /* We usually generate meeting IDs as a UUID - include just their first octet. */
+            context.put("meeting_id", uuidTrimmer.matcher(meetingId).replaceAll("$1"));
+        }
+
         logger = new LoggerImpl(Conference.class.getName(), new LogContext(context));
         this.id = Objects.requireNonNull(id, "id");
-        this.gid = gid;
         this.conferenceName = conferenceName;
-        this.shim = new ConferenceShim(this, logger);
         this.colibri2Handler = new Colibri2ConferenceHandler(this, logger);
-        colibriQueue = new PacketQueue<>(
-                Integer.MAX_VALUE,
-                true,
-                "colibri-queue",
+        colibriQueue = new ColibriQueue(
                 request ->
                 {
                     try
                     {
+                        logger.info( () -> {
+                            String reqStr = XmlStringBuilderUtil.toStringOpt(request.getRequest());
+                            if (VideobridgeConfig.getRedactRemoteAddresses())
+                            {
+                                reqStr = RedactColibriIp.Companion.redact(reqStr);
+                            }
+                            return "RECV colibri2 request: " + reqStr;
+                        });
                         long start = System.currentTimeMillis();
-                        IQ requestIQ = request.getRequest();
-                        IQ response;
-                        boolean expire = false;
-                        if (requestIQ instanceof ColibriConferenceIQ)
-                        {
-                            response = shim.handleColibriConferenceIQ((ColibriConferenceIQ)requestIQ);
-                        }
-                        else if (requestIQ instanceof ConferenceModifyIQ)
-                        {
-                            Pair<IQ, Boolean> p =
-                                colibri2Handler.handleConferenceModifyIQ((ConferenceModifyIQ)requestIQ);
-                            response = p.getFirst();
-                            expire = p.getSecond();
-                        }
-                        else
-                        {
-                            throw new IllegalStateException("Bad IQ " + request.getClass() + " passed to colibriIQ");
-                        }
+                        Pair<IQ, Boolean> p = colibri2Handler.handleConferenceModifyIQ(request.getRequest());
+                        IQ response = p.getFirst();
+                        boolean expire = p.getSecond();
                         long end = System.currentTimeMillis();
                         long processingDelay = end - start;
                         long totalDelay = end - request.getReceiveTime();
@@ -303,9 +243,15 @@ public class Conference
                         request.getTotalDelayStats().addDelay(totalDelay);
                         if (processingDelay > 100)
                         {
+                            String reqStr = XmlStringBuilderUtil.toStringOpt(request.getRequest());
+                            if (VideobridgeConfig.getRedactRemoteAddresses())
+                            {
+                                reqStr = RedactColibriIp.Companion.redact(reqStr);
+                            }
                             logger.warn("Took " + processingDelay + " ms to process an IQ (total delay "
-                                    + totalDelay + " ms): " + request.getRequest().toXML());
+                                    + totalDelay + " ms): " + reqStr);
                         }
+                        logger.info("SENT colibri2 response: " + XmlStringBuilderUtil.toStringOpt(response));
                         request.getCallback().invoke(response);
                         if (expire) videobridge.expireConference(this);
                     }
@@ -313,18 +259,16 @@ public class Conference
                     {
                         logger.warn("Failed to handle colibri request: ", e);
                         request.getCallback().invoke(
-                                IQUtils.createError(
+                                createError(
                                         request.getRequest(),
                                         StanzaError.Condition.internal_server_error,
                                         e.getMessage()));
                     }
                     return true;
-                },
-                TaskPools.IO_POOL,
-                Clock.systemUTC(), // TODO: using the Videobridge clock breaks tests somehow
-                /* Allow running tasks to complete (so we can close the queue from within the task. */
-                false
-        );
+                }
+        )
+        {
+        };
 
         speechActivity = new ConferenceSpeechActivity(new SpeechActivityListener());
         updateLastNEndpointsFuture = TaskPools.SCHEDULED_POOL.scheduleAtFixedRate(() -> {
@@ -342,8 +286,7 @@ public class Conference
 
         }, 3, 3, TimeUnit.SECONDS);
 
-        Videobridge.Statistics videobridgeStatistics = videobridge.getStatistics();
-        videobridgeStatistics.totalConferencesCreated.incrementAndGet();
+        VideobridgeMetrics.conferencesCreated.inc();
         epConnectionStatusMonitor = new EndpointConnectionStatusMonitor(this, TaskPools.SCHEDULED_POOL, logger);
         epConnectionStatusMonitor.start();
     }
@@ -375,16 +318,6 @@ public class Conference
     }
 
     /**
-     * Gets the statistics of this {@link Conference}.
-     *
-     * @return the statistics of this {@link Conference}.
-     */
-    public Statistics getStatistics()
-    {
-        return statistics;
-    }
-
-    /**
      * Sends a message to a subset of endpoints in the call, primary use
      * case being a message that has originated from an endpoint (as opposed to
      * a message originating from the bridge and being sent to all endpoints in
@@ -394,25 +327,18 @@ public class Conference
      * @param endpoints the list of <tt>Endpoint</tt>s to which the message will
      * be sent.
      */
-    public void sendMessage(
-        BridgeChannelMessage msg,
-        List<Endpoint> endpoints,
-        boolean sendToOcto)
+    public void sendMessage(BridgeChannelMessage msg, List<Endpoint> endpoints, boolean sendToRelays)
     {
         for (Endpoint endpoint : endpoints)
         {
             endpoint.sendMessage(msg);
         }
 
-        if (sendToOcto)
+        if (sendToRelays)
         {
             for (Relay relay: relaysById.values())
             {
                 relay.sendMessage(msg);
-            }
-            if (tentacle != null)
-            {
-                tentacle.sendMessage(msg);
             }
         }
     }
@@ -424,10 +350,7 @@ public class Conference
      * @param msg the message to be sent
      * @param meshId the ID of the mesh from which the message was received.
      */
-    public void sendMessageFromRelay(
-        BridgeChannelMessage msg,
-        boolean sendToEndpoints,
-        @Nullable String meshId)
+    public void sendMessageFromRelay(BridgeChannelMessage msg, boolean sendToEndpoints, @Nullable String meshId)
     {
         if (sendToEndpoints)
         {
@@ -444,23 +367,6 @@ public class Conference
                 relay.sendMessage(msg);
             }
         }
-
-        /* Never need to send to tentacle, meshId != null cannot be true for Colibri1. */
-    }
-
-    /**
-     * Used to send a message to a subset of endpoints in the call, primary use
-     * case being a message that has originated from an endpoint (as opposed to
-     * a message originating from the bridge and being sent to all endpoints in
-     * the call, for that see {@link #broadcastMessage(BridgeChannelMessage)}.
-     *
-     * @param msg the message to be sent
-     * @param endpoints the list of <tt>Endpoint</tt>s to which the message will
-     * be sent.
-     */
-    public void sendMessage(BridgeChannelMessage msg, List<Endpoint> endpoints)
-    {
-        sendMessage(msg, endpoints, false);
     }
 
     /**
@@ -468,9 +374,9 @@ public class Conference
      *
      * @param msg the message to be broadcast.
      */
-    public void broadcastMessage(BridgeChannelMessage msg, boolean sendToOcto)
+    public void broadcastMessage(BridgeChannelMessage msg, boolean sendToRelays)
     {
-        sendMessage(msg, getLocalEndpoints(), sendToOcto);
+        sendMessage(msg, getLocalEndpoints(), sendToRelays);
     }
 
     /**
@@ -519,33 +425,6 @@ public class Conference
     }
 
     /**
-     * Sets the values of the properties of a specific
-     * <tt>ColibriConferenceIQ</tt> to the values of the respective
-     * properties of this instance. Thus, the specified <tt>iq</tt> may be
-     * thought of as a description of this instance.
-     * <p>
-     * <b>Note</b>: The copying of the values is shallow i.e. the
-     * <tt>Content</tt>s of this instance are not described in the specified
-     * <tt>iq</tt>.
-     * </p>
-     *
-     * @param iq the <tt>ColibriConferenceIQ</tt> to set the values of the
-     * properties of this instance on
-     */
-    public void describeShallow(ColibriConferenceIQ iq)
-    {
-        iq.setID(getID());
-        if (conferenceName == null)
-        {
-            iq.setName(null);
-        }
-        else
-        {
-            iq.setName(conferenceName);
-        }
-    }
-
-    /**
      * Runs {@link #lastNEndpointsChanged()} in an IO pool thread.
      */
     private void lastNEndpointsChangedAsync()
@@ -576,19 +455,22 @@ public class Conference
      * dominant speaker.
      * @param recentSpeakers the list of recent speakers (including the dominant speaker at index 0).
      */
-    private void recentSpeakersChanged(List<AbstractEndpoint> recentSpeakers, boolean dominantSpeakerChanged)
+    private void recentSpeakersChanged(
+            List<AbstractEndpoint> recentSpeakers,
+            boolean dominantSpeakerChanged,
+            boolean silence)
     {
         if (!recentSpeakers.isEmpty())
         {
             List<String> recentSpeakersIds
                     = recentSpeakers.stream().map(AbstractEndpoint::getId).collect(Collectors.toList());
             logger.info("Recent speakers changed: " + recentSpeakersIds + ", dominant speaker changed: "
-                    + dominantSpeakerChanged);
-            broadcastMessage(new DominantSpeakerMessage(recentSpeakersIds));
+                    + dominantSpeakerChanged + " silence:" + silence);
+            broadcastMessage(new DominantSpeakerMessage(recentSpeakersIds, silence));
 
-            if (dominantSpeakerChanged)
+            if (dominantSpeakerChanged && !silence)
             {
-                getVideobridge().getStatistics().totalDominantSpeakerChanges.increment();
+                VideobridgeMetrics.dominantSpeakerChanges.inc();
                 if (getEndpointCount() > 2)
                 {
                     maybeSendKeyframeRequest(recentSpeakers.get(0));
@@ -609,12 +491,27 @@ public class Conference
         }
 
         boolean anyEndpointInStageView = false;
+        Set<String> allOnStageSourceNames = new HashSet<>();
         for (Endpoint otherEndpoint : getLocalEndpoints())
         {
-            if (otherEndpoint != dominantSpeaker && otherEndpoint.isInStageView())
+            if (otherEndpoint != dominantSpeaker)
             {
-                anyEndpointInStageView = true;
-                break;
+                allOnStageSourceNames.addAll(otherEndpoint.getOnStageSources());
+            }
+        }
+
+        for (String onStageSourceName : allOnStageSourceNames)
+        {
+            AbstractEndpoint owner = findSourceOwner(onStageSourceName);
+            if (owner != null)
+            {
+                // Do not anticipate a switch if all on-stage sources are DESKTOP
+                MediaSourceDesc onStageSource = owner.findMediaSourceDesc(onStageSourceName);
+                if (onStageSource != null && onStageSource.getVideoType() == VideoType.CAMERA)
+                {
+                    anyEndpointInStageView = true;
+                    break;
+                }
             }
         }
 
@@ -622,10 +519,10 @@ public class Conference
         {
             // If all other endpoints are in tile view, there is no switch to anticipate. Don't trigger an unnecessary
             // keyframe.
-            getVideobridge().getStatistics().preemptiveKeyframeRequestsSuppressed.incrementAndGet();
+            VideobridgeMetrics.preemptiveKeyframeRequestsSuppressed.inc();
             return;
         }
-        getVideobridge().getStatistics().preemptiveKeyframeRequestsSent.incrementAndGet();
+        VideobridgeMetrics.preemptiveKeyframeRequestsSent.inc();
 
         double senderRtt = getRtt(dominantSpeaker);
         double maxReceiveRtt = getMaxReceiverRtt(dominantSpeaker.getId());
@@ -652,12 +549,10 @@ public class Conference
         }
         else
         {
-            // Octo endpoint
-            // TODO(brian): we don't currently have a way to get the RTT from this bridge
-            // to a remote endpoint, so we hard-code a value here.  Discussed this with
-            // Boris, and we talked about perhaps having OctoEndpoint periodically
-            // send pings to the remote endpoint to calculate its RTT from the perspective
-            // of this bridge.
+            // This is a RelayedEndpoint
+            // TODO(brian): we don't currently have a way to get the RTT from this bridge to a remote endpoint, so we
+            // hard-code a value here. We could relatively easily get the RTT to the remote relay. Should we take that
+            // into account?
             return 100;
         }
     }
@@ -677,7 +572,7 @@ public class Conference
      * respective <tt>Channel</tt>s. Releases the resources acquired by this
      * instance throughout its life time and prepares it to be garbage
      * collected.
-     *
+     * <p/>
      * NOTE: this should _only_ be called by the Conference "manager" (in this
      * case, Videobridge).  If you need to expire a Conference from elsewhere, use
      * {@link Videobridge#expireConference(Conference)}
@@ -703,12 +598,8 @@ public class Conference
 
         logger.debug(() -> "Expiring endpoints.");
         getEndpoints().forEach(AbstractEndpoint::expire);
+        getRelays().forEach(Relay::expire);
         speechActivity.expire();
-        if (tentacle != null)
-        {
-            tentacle.expire();
-            tentacle = null;
-        }
 
         updateStatisticsOnExpire();
     }
@@ -720,55 +611,20 @@ public class Conference
     {
         long durationSeconds = Math.round((System.currentTimeMillis() - creationTime) / 1000d);
 
-        Videobridge.Statistics videobridgeStatistics = getVideobridge().getStatistics();
+        VideobridgeMetrics.conferencesCompleted.inc();
+        VideobridgeMetrics.totalConferenceSeconds.add(durationSeconds);
 
-        videobridgeStatistics.totalConferencesCompleted.incrementAndGet();
-        videobridgeStatistics.totalConferenceSeconds.addAndGet(durationSeconds);
-
-        videobridgeStatistics.totalBytesReceived.addAndGet(statistics.totalBytesReceived.get());
-        videobridgeStatistics.totalBytesSent.addAndGet(statistics.totalBytesSent.get());
-        videobridgeStatistics.totalPacketsReceived.addAndGet(statistics.totalPacketsReceived.get());
-        videobridgeStatistics.totalPacketsSent.addAndGet(statistics.totalPacketsSent.get());
-
-        videobridgeStatistics.totalRelayBytesReceived.addAndGet(statistics.totalRelayBytesReceived.get());
-        videobridgeStatistics.totalRelayBytesSent.addAndGet(statistics.totalRelayBytesSent.get());
-        videobridgeStatistics.totalRelayPacketsReceived.addAndGet(statistics.totalRelayPacketsReceived.get());
-        videobridgeStatistics.totalRelayPacketsSent.addAndGet(statistics.totalRelayPacketsSent.get());
-
-        boolean hasFailed = statistics.hasIceFailedEndpoint && !statistics.hasIceSucceededEndpoint;
-        boolean hasPartiallyFailed = statistics.hasIceFailedEndpoint && statistics.hasIceSucceededEndpoint;
-
-        videobridgeStatistics.dtlsFailedEndpoints.addAndGet(statistics.dtlsFailedEndpoints.get());
-
-        if (hasPartiallyFailed)
-        {
-            videobridgeStatistics.totalPartiallyFailedConferences.incrementAndGet();
-        }
-
-        if (hasFailed)
-        {
-            videobridgeStatistics.totalFailedConferences.incrementAndGet();
-        }
-
-        if (logger.isInfoEnabled())
-        {
-            StringBuilder sb = new StringBuilder("expire_conf,");
-            sb.append("duration=").append(durationSeconds)
-                .append(",has_failed=").append(hasFailed)
-                .append(",has_partially_failed=").append(hasPartiallyFailed);
-            logger.info(sb.toString());
-        }
+        logger.info("expire_conf,duration=" + durationSeconds);
     }
 
     /**
      * Finds an <tt>Endpoint</tt> of this <tt>Conference</tt> which sends an RTP
-     * stream with a specific SSRC and with a specific <tt>MediaType</tt>.
+     * stream with a specific SSRC.
      *
      * @param receiveSSRC the SSRC of an RTP stream received by this
      * <tt>Conference</tt> whose sending <tt>Endpoint</tt> is to be found
      * @return <tt>Endpoint</tt> of this <tt>Conference</tt> which sends an RTP
-     * stream with the specified <tt>ssrc</tt> and with the specified
-     * <tt>mediaType</tt>; otherwise, <tt>null</tt>
+     * stream with the specified <tt>ssrc</tt>; otherwise, <tt>null</tt>
      */
     AbstractEndpoint findEndpointByReceiveSSRC(long receiveSSRC)
     {
@@ -822,32 +678,28 @@ public class Conference
      * @param iceControlling {@code true} if the ICE agent of this endpoint's
      * transport will be initialized to serve as a controlling ICE agent;
      * otherwise, {@code false}
-     * @param sourceNames whether this endpoint signaled the source names support.
+     * @param doSsrcRewriting whether this endpoint signaled SSRC rewriting support.
      * @return an <tt>Endpoint</tt> participating in this <tt>Conference</tt>
      */
     @NotNull
-    public Endpoint createLocalEndpoint(String id, boolean iceControlling, boolean sourceNames)
+    public Endpoint createLocalEndpoint(
+            String id,
+            boolean iceControlling,
+            boolean doSsrcRewriting,
+            boolean visitor,
+            boolean privateAddresses)
     {
         final AbstractEndpoint existingEndpoint = getEndpoint(id);
-        if (existingEndpoint instanceof OctoEndpoint)
-        {
-            // It is possible that an Endpoint was migrated from another bridge
-            // in the conference to this one, and the sources lists (which
-            // implicitly signal the Octo endpoints in the conference) haven't
-            // been updated yet. We'll force the Octo endpoint to expire and
-            // we'll continue with the creation of a new local Endpoint for the
-            // participant.
-            existingEndpoint.expire();
-        }
-        else if (existingEndpoint != null)
+        if (existingEndpoint != null)
         {
             throw new IllegalArgumentException("Local endpoint with ID = " + id + "already created");
         }
 
-        final Endpoint endpoint = new Endpoint(id, this, logger, iceControlling, sourceNames);
-        videobridge.endpointCreated();
+        final Endpoint endpoint = new Endpoint(
+                id, this, logger, iceControlling, doSsrcRewriting, visitor, privateAddresses);
+        videobridge.localEndpointCreated(visitor);
 
-        subscribeToEndpointEvents(endpoint);
+        endpoint.addEventHandler(() -> endpointSourcesChanged(endpoint));
 
         addEndpoints(Collections.singleton(endpoint));
 
@@ -870,50 +722,28 @@ public class Conference
         return relay;
     }
 
-    private void subscribeToEndpointEvents(AbstractEndpoint endpoint)
+    /**
+     * One or more endpoints was added or removed.
+     * @param includesNonVisitors Whether any of the endpoints changed was not a visitor.
+     */
+    private void endpointsChanged(boolean includesNonVisitors)
     {
-        endpoint.addEventHandler(new AbstractEndpoint.EventHandler()
+        if (includesNonVisitors)
         {
-            @Override
-            public void iceSucceeded()
-            {
-                getStatistics().hasIceSucceededEndpoint = true;
-                getVideobridge().getStatistics().totalIceSucceeded.incrementAndGet();
-            }
-
-            @Override
-            public void iceFailed()
-            {
-                getStatistics().hasIceFailedEndpoint = true;
-                getVideobridge().getStatistics().totalIceFailed.incrementAndGet();
-            }
-
-            @Override
-            public void sourcesChanged()
-            {
-                endpointSourcesChanged(endpoint);
-            }
-        });
+            speechActivity.endpointsChanged(getNonVisitorEndpoints());
+        }
     }
 
     /**
-     * An endpoint was added or removed.
-     */
-    private void endpointsChanged()
-    {
-        speechActivity.endpointsChanged(getEndpoints());
-    }
-
-    /**
-     * The media sources of one of the endpoints in this conference
-     * changed.
+     * The media sources of one of the endpoints in this conference changed.
      *
-     * @param endpoint the endpoint, or {@code null} if it was an Octo endpoint.
+     * @param endpoint the endpoint
      */
-    public void endpointSourcesChanged(AbstractEndpoint endpoint)
+    private void endpointSourcesChanged(@NotNull Endpoint endpoint)
     {
         // Force an update to be propagated to each endpoint's bitrate controller.
-        lastNEndpointsChanged();
+        // We run this async because this method is called in the Colibri critical path.
+        lastNEndpointsChangedAsync();
     }
 
     /**
@@ -977,14 +807,22 @@ public class Conference
         return new ArrayList<>(this.endpointsById.values());
     }
 
+    /**
+     * Gets the <tt>Endpoint</tt>s participating in this conference that are not visitors.
+     */
+    public List<AbstractEndpoint> getNonVisitorEndpoints()
+    {
+        return this.endpointsById.values().stream().filter(ep -> !ep.getVisitor()).collect(Collectors.toList());
+    }
+
     List<AbstractEndpoint> getOrderedEndpoints()
     {
         return speechActivity.getOrderedEndpoints();
     }
 
     /**
-     * Gets the list of endpoints which are local to this bridge (as opposed
-     * to being on a remote bridge through Octo).
+     * Gets the list of endpoints which are local to this bridge (as opposed to {@link RelayedEndpoint}s connected to
+     * one of our {@link Relay}s).
      */
     public List<Endpoint> getLocalEndpoints()
     {
@@ -994,7 +832,10 @@ public class Conference
     /**
      * Gets the list of the relays this conference is using.
      */
-    public List<Relay> getRelays() { return new ArrayList<>(this.relaysById.values()); }
+    public List<Relay> getRelays()
+    {
+        return new ArrayList<>(this.relaysById.values());
+    }
 
     /**
      * Gets the (unique) identifier/ID of this instance.
@@ -1004,11 +845,6 @@ public class Conference
     public final String getID()
     {
         return id;
-    }
-
-    public final boolean isCallStatsEnabled()
-    {
-        return isCallStatsEnabled;
     }
 
     /**
@@ -1089,27 +925,23 @@ public class Conference
         final AbstractEndpoint removedEndpoint;
         String id = endpoint.getId();
         removedEndpoint = endpointsById.remove(id);
-        if (removedEndpoint != null)
+        if (removedEndpoint == null)
         {
+            logger.warn("No endpoint found, id=" + id);
+            return;
+        }
+
+        if (removedEndpoint instanceof Endpoint)
+        {
+            // The removed endpoint was a local Endpoint as opposed to a RelayedEndpoint.
             updateEndpointsCache();
+            endpointsById.values().forEach(e -> e.otherEndpointExpired(removedEndpoint));
+            videobridge.localEndpointExpired(removedEndpoint.getVisitor());
         }
 
-        endpointsById.forEach((i, senderEndpoint) -> senderEndpoint.removeReceiver(id));
-
+        relaysById.forEach((i, relay) -> relay.endpointExpired(id));
         endpoint.getSsrcs().forEach(ssrc -> endpointsBySsrc.remove(ssrc, endpoint));
-
-        if (tentacle != null)
-        {
-            tentacle.endpointExpired(id);
-        }
-
-        relaysById.forEach((i, relay) -> relay.localEndpointExpired(id));
-
-        if (removedEndpoint != null)
-        {
-            endpointsChanged();
-            videobridge.endpointExpired();
-        }
+        endpointsChanged(removedEndpoint.getVisitor());
     }
 
     /**
@@ -1147,7 +979,9 @@ public class Conference
 
         updateEndpointsCache();
 
-        endpointsChanged();
+        boolean hasNonVisitor = endpoints.stream().anyMatch(endpoint -> !endpoint.getVisitor());
+
+        endpointsChanged(hasNonVisitor);
     }
 
     /**
@@ -1171,7 +1005,7 @@ public class Conference
 
             if (!recentSpeakers.isEmpty())
             {
-                endpoint.sendMessage(new DominantSpeakerMessage(recentSpeakers));
+                endpoint.sendMessage(new DominantSpeakerMessage(recentSpeakers, speechActivity.isInSilence()));
             }
         }
     }
@@ -1188,11 +1022,6 @@ public class Conference
         {
             logger.warn("SSRC " + ssrc + " moved from ep " + oldEndpoint.getId() + " to ep " + endpoint.getId());
         }
-    }
-
-    public void removeEndpointSsrc(@NotNull AbstractEndpoint endpoint, long ssrc)
-    {
-        endpointsBySsrc.remove(ssrc, endpoint);
     }
 
     /**
@@ -1214,13 +1043,11 @@ public class Conference
     }
 
     /**
-     * @return the global ID of the conference (see {@link #gid)}, or
-     * {@link #GID_NOT_SET} if none has been set.
-     * @see #gid
+     * @return {@code true} if this {@link Conference} is in more than one relay mesh.
      */
-    public long getGid()
+    private boolean inMultipleMeshes()
     {
-        return gid;
+        return relaysById.values().stream().map(Relay::getMeshId).collect(Collectors.toSet()).size() > 1;
     }
 
     /**
@@ -1230,15 +1057,8 @@ public class Conference
     {
         // Allow a conference to have no endpoints in the first 20 seconds.
         return getEndpointCount() == 0
+                && !inMultipleMeshes()
                 && (System.currentTimeMillis() - creationTime > 20000);
-    }
-
-    /**
-     * @return this {@link Conference}'s Colibri shim.
-     */
-    public ConferenceShim getShim()
-    {
-        return shim;
     }
 
     /**
@@ -1249,7 +1069,9 @@ public class Conference
     {
         if (!LoudestConfig.Companion.getRouteLoudestOnly())
         {
-            return false;
+            // When "route loudest only" is disabled all speakers should be considered "ranked" (we forward all audio
+            // and stats).
+            return true;
         }
         return speechActivity.isAmongLoudest(ep.getId());
     }
@@ -1296,14 +1118,6 @@ public class Conference
                 prevHandler = relay;
             }
         }
-        if (tentacle != null && tentacle.wants(packetInfo))
-        {
-            if (prevHandler != null)
-            {
-                prevHandler.send(packetInfo.clone());
-            }
-            prevHandler = tentacle;
-        }
 
         if (prevHandler != null)
         {
@@ -1316,30 +1130,13 @@ public class Conference
         }
     }
 
-    /**
-     * @return The {@link ConfOctoTransport} for this conference.
-     */
-    public ConfOctoTransport getTentacle()
+    public boolean hasRelays()
     {
-        if (gid == GID_NOT_SET)
-        {
-            throw new IllegalStateException("Can not enable Octo without the GID being set.");
-        }
-        if (tentacle == null)
-        {
-            tentacle = new ConfOctoTransport(this);
-        }
-        return tentacle;
-    }
-
-    public boolean isOctoEnabled()
-    {
-        return tentacle != null;
+        return !relaysById.isEmpty();
     }
 
     /**
      * Handles an RTP/RTCP packet coming from a specific endpoint.
-     * @param packetInfo
      */
     public void handleIncomingPacket(PacketInfo packetInfo)
     {
@@ -1352,12 +1149,33 @@ public class Conference
         }
         else if (packet instanceof RtcpFbPliPacket || packet instanceof RtcpFbFirPacket)
         {
+            AbstractEndpoint targetEndpoint = null;
+            boolean rewriter = false;
+
             long mediaSsrc = (packet instanceof RtcpFbPliPacket)
                 ? ((RtcpFbPliPacket) packet).getMediaSourceSsrc()
                 : ((RtcpFbFirPacket) packet).getMediaSenderSsrc();
 
-            // XXX we could make this faster with a map
-            AbstractEndpoint targetEndpoint = findEndpointByReceiveSSRC(mediaSsrc);
+            /* If we are rewriting SSRCs to this endpoint, we must ask
+            it to convert back the SSRC to the media sender's SSRC. */
+            String endpointId = packetInfo.getEndpointId();
+            if (endpointId != null)
+            {
+                AbstractEndpoint ep = getEndpoint(endpointId);
+                if (ep instanceof Endpoint && ((Endpoint) ep).doesSsrcRewriting())
+                {
+                    rewriter = true;
+                    String owner = ((Endpoint) ep).unmapRtcpFbSsrc((RtcpFbPacket) packet);
+                    if (owner != null)
+                        targetEndpoint = getEndpoint(owner);
+                }
+            }
+
+            if (!rewriter)
+            {
+                // XXX we could make this faster with a map
+                targetEndpoint = findEndpointByReceiveSSRC(mediaSsrc);
+            }
 
             PotentialPacketHandler pph = null;
             if (targetEndpoint instanceof Endpoint)
@@ -1368,14 +1186,11 @@ public class Conference
             {
                 pph = ((RelayedEndpoint)targetEndpoint).getRelay();
             }
-            else if (targetEndpoint instanceof OctoEndpoint)
-            {
-                pph = tentacle;
-            }
 
             // This is not a redundant check. With Octo and 3 or more bridges,
             // some PLI or FIR will come from Octo but the target endpoint will
             // also be Octo. We need to filter these out.
+            // TODO: does this still apply with Relays?
             if (pph == null)
             {
                 if (logger.isDebugEnabled())
@@ -1405,13 +1220,13 @@ public class Conference
     public boolean levelChanged(@NotNull AbstractEndpoint endpoint, long level)
     {
         SpeakerRanking ranking = speechActivity.levelChanged(endpoint, level);
-        if (ranking == null)
+        if (ranking == null || !routeLoudestOnly)
             return false;
         if (ranking.isDominant && LoudestConfig.Companion.getAlwaysRouteDominant())
             return false;
         if (ranking.energyRanking < LoudestConfig.Companion.getNumLoudest())
             return false;
-        videobridge.getStatistics().tossedPacketsEnergy.addValue(ranking.energyScore);
+        VideobridgeMetrics.tossedPacketsEnergy.getHistogram().observe(ranking.energyScore);
         return true;
     }
 
@@ -1465,16 +1280,10 @@ public class Conference
 
         if (full)
         {
-            debugState.put("gid", gid);
             debugState.put("expired", expired.get());
             debugState.put("creationTime", creationTime);
             debugState.put("speechActivity", speechActivity.getDebugState());
-            debugState.put("statistics", statistics.getJson());
             //debugState.put("encodingsManager", encodingsManager.getDebugState());
-            ConfOctoTransport tentacle = this.tentacle;
-            debugState.put(
-                    "tentacle",
-                    tentacle == null ? null : tentacle.getDebugState());
         }
 
         JSONObject endpoints = new JSONObject();
@@ -1524,98 +1333,6 @@ public class Conference
     }
 
     /**
-     * Holds conference statistics.
-     */
-    public static class Statistics
-    {
-        /**
-         * The total number of bytes received in RTP packets in channels in this
-         * conference. Note that this is only updated when channels expire.
-         */
-        public AtomicLong totalBytesReceived = new AtomicLong();
-
-        /**
-         * The total number of bytes sent in RTP packets in channels in this
-         * conference. Note that this is only updated when channels expire.
-         */
-        public AtomicLong totalBytesSent = new AtomicLong();
-
-        /**
-         * The total number of RTP packets received in channels in this
-         * conference. Note that this is only updated when channels expire.
-         */
-        public AtomicLong totalPacketsReceived = new AtomicLong();
-
-        /**
-         * The total number of RTP packets received in channels in this
-         * conference. Note that this is only updated when channels expire.
-         */
-        public AtomicLong totalPacketsSent = new AtomicLong();
-
-        /**
-         * The total number of bytes received in RTP packets in relays in this
-         * conference. Note that this is only updated when relays expire.
-         */
-        public AtomicLong totalRelayBytesReceived = new AtomicLong();
-
-        /**
-         * The total number of bytes sent in RTP packets in relays in this
-         * conference. Note that this is only updated when relays expire.
-         */
-        public AtomicLong totalRelayBytesSent = new AtomicLong();
-
-        /**
-         * The total number of RTP packets received in relays in this
-         * conference. Note that this is only updated when relays expire.
-         */
-        public AtomicLong totalRelayPacketsReceived = new AtomicLong();
-
-        /**
-         * The total number of RTP packets received in relays in this
-         * conference. Note that this is only updated when relays expire.
-         */
-        public AtomicLong totalRelayPacketsSent = new AtomicLong();
-
-        /**
-         * Whether at least one endpoint in this conference failed ICE.
-         */
-        public boolean hasIceFailedEndpoint = false;
-
-        /**
-         * Whether at least one endpoint in this conference completed ICE
-         * successfully.
-         */
-        public boolean hasIceSucceededEndpoint = false;
-
-        /**
-         * Number of endpoints whose ICE connection was established, but DTLS
-         * wasn't (at the time of expiration).
-         */
-        public AtomicInteger dtlsFailedEndpoints = new AtomicInteger();
-
-        /**
-         * Gets a snapshot of this object's state as JSON.
-         */
-        @SuppressWarnings("unchecked")
-        private JSONObject getJson()
-        {
-            JSONObject jsonObject = new JSONObject();
-            jsonObject.put("total_bytes_received", totalBytesReceived.get());
-            jsonObject.put("total_bytes_sent", totalBytesSent.get());
-            jsonObject.put("total_packets_received", totalPacketsReceived.get());
-            jsonObject.put("total_packets_sent", totalPacketsSent.get());
-            jsonObject.put("total_relay_bytes_received", totalRelayBytesReceived.get());
-            jsonObject.put("total_relay_bytes_sent", totalRelayBytesSent.get());
-            jsonObject.put("total_relay_packets_received", totalRelayPacketsReceived.get());
-            jsonObject.put("total_relay_packets_sent", totalRelayPacketsSent.get());
-            jsonObject.put("has_failed_endpoint", hasIceFailedEndpoint);
-            jsonObject.put("has_succeeded_endpoint", hasIceSucceededEndpoint);
-            jsonObject.put("dtls_failed_endpoints", dtlsFailedEndpoints.get());
-            return jsonObject;
-        }
-    }
-
-    /**
      * This is a no-op diagnostic context (one that will record nothing) meant
      * to disable logging of time-series for health checks.
      */
@@ -1658,9 +1375,12 @@ public class Conference
     private class SpeechActivityListener implements ConferenceSpeechActivity.Listener
     {
         @Override
-        public void recentSpeakersChanged(List<AbstractEndpoint> recentSpeakers, boolean dominantSpeakerChanged)
+        public void recentSpeakersChanged(
+                List<AbstractEndpoint> recentSpeakers,
+                boolean dominantSpeakerChanged,
+                boolean silence)
         {
-            Conference.this.recentSpeakersChanged(recentSpeakers, dominantSpeakerChanged);
+            Conference.this.recentSpeakersChanged(recentSpeakers, dominantSpeakerChanged, silence);
         }
 
         @Override

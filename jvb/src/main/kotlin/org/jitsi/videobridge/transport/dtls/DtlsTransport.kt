@@ -16,13 +16,17 @@
 
 package org.jitsi.videobridge.transport.dtls
 
+import org.ice4j.util.Buffer
 import org.jitsi.nlj.dtls.DtlsClient
 import org.jitsi.nlj.dtls.DtlsServer
 import org.jitsi.nlj.dtls.DtlsStack
 import org.jitsi.nlj.srtp.TlsRole
+import org.jitsi.nlj.util.BufferPool
 import org.jitsi.utils.OrderedJsonObject
 import org.jitsi.utils.logging2.Logger
 import org.jitsi.utils.logging2.createChildLogger
+import org.jitsi.utils.queue.PacketQueue
+import org.jitsi.videobridge.util.TaskPools
 import org.jitsi.xmpp.extensions.jingle.DtlsFingerprintPacketExtension
 import org.jitsi.xmpp.extensions.jingle.IceUdpTransportPacketExtension
 import java.util.concurrent.atomic.AtomicBoolean
@@ -39,14 +43,17 @@ import java.util.concurrent.atomic.AtomicBoolean
  * be passed to the [outgoingDataHandler], which should be set by an
  * interested party.
  */
-class DtlsTransport(parentLogger: Logger) {
+class DtlsTransport(parentLogger: Logger, id: String) {
     private val logger = createChildLogger(parentLogger)
 
     private val running = AtomicBoolean(true)
+
     @JvmField
     var incomingDataHandler: IncomingDataHandler? = null
+
     @JvmField
     var outgoingDataHandler: OutgoingDataHandler? = null
+
     @JvmField
     var eventHandler: EventHandler? = null
     private var dtlsHandshakeComplete = false
@@ -55,6 +62,29 @@ class DtlsTransport(parentLogger: Logger) {
         get() = dtlsHandshakeComplete
 
     private val stats = Stats()
+
+    /** Whether to advertise cryptex to peers. */
+    var cryptex = false
+
+    val dtlsQueue = object : PacketQueue<Buffer>(
+        128,
+        null,
+        "dtls-queue-$id",
+        { buffer: Buffer ->
+            try {
+                dtlsDataReceived(buffer.buffer, buffer.offset, buffer.length)
+                true
+            } catch (e: Exception) {
+                logger.warn("Failed to handle DTLS data", e)
+                false
+            }
+        },
+        TaskPools.IO_POOL,
+    ) {
+        override fun releasePacket(buffer: Buffer) {
+            BufferPool.returnBuffer(buffer.buffer)
+        }
+    }
 
     /**
      * The DTLS stack instance
@@ -133,7 +163,7 @@ class DtlsTransport(parentLogger: Logger) {
         }
     }
 
-    fun setRemoteFingerprints(remoteFingerprints: Map<String, String>) {
+    fun setRemoteFingerprints(remoteFingerprints: Map<String, List<String>>) {
         // Don't pass an empty list to the stack in order to avoid wiping
         // certificates that were contained in a previous request.
         if (remoteFingerprints.isEmpty()) {
@@ -141,14 +171,6 @@ class DtlsTransport(parentLogger: Logger) {
         }
 
         dtlsStack.remoteFingerprints = remoteFingerprints
-        val hasSha1Hash = remoteFingerprints.keys.any { it.equals("sha-1", ignoreCase = true) }
-        if (dtlsStack.role == null && hasSha1Hash) {
-            // hack(george) Jigasi sends a sha-1 dtls fingerprint without a
-            // setup attribute and it assumes a server role for the bridge.
-
-            logger.info("Assume that the remote side is Jigasi, we'll act as server")
-            dtlsStack.actAsServer()
-        }
     }
 
     /**
@@ -167,19 +189,23 @@ class DtlsTransport(parentLogger: Logger) {
         }
         fingerprintPE.fingerprint = dtlsStack.localFingerprint
         fingerprintPE.hash = dtlsStack.localFingerprintHashFunction
+        if (cryptex) {
+            fingerprintPE.cryptex = true
+        }
     }
+
+    fun enqueueBuffer(buffer: Buffer) = dtlsQueue.add(buffer)
 
     /**
      * Notify this layer that DTLS data has been received from the network
      */
-    fun dtlsDataReceived(data: ByteArray, off: Int, len: Int) =
+    private fun dtlsDataReceived(data: ByteArray, off: Int, len: Int) =
         dtlsStack.processIncomingProtocolData(data, off, len)
 
     /**
      * Send out DTLS data
      */
-    fun sendDtlsData(data: ByteArray, off: Int, len: Int) =
-        dtlsStack.sendApplicationData(data, off, len)
+    fun sendDtlsData(data: ByteArray, off: Int, len: Int) = dtlsStack.sendApplicationData(data, off, len)
 
     fun stop() {
         if (running.compareAndSet(true, false)) {
@@ -190,6 +216,7 @@ class DtlsTransport(parentLogger: Logger) {
 
     fun getDebugState(): OrderedJsonObject = stats.toJson().apply {
         put("running", running.get())
+        put("role", dtlsStack.role.toString())
         put("is_connected", isConnected)
     }
 

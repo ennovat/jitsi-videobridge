@@ -16,11 +16,15 @@
 package org.jitsi.videobridge.websocket;
 
 import org.eclipse.jetty.websocket.api.*;
-import org.jitsi.utils.collections.*;
 import org.jitsi.utils.logging2.*;
 import org.jitsi.videobridge.*;
+import org.jitsi.videobridge.util.*;
+import org.jitsi.videobridge.websocket.config.*;
 
+import java.nio.*;
+import java.time.*;
 import java.util.*;
+import java.util.concurrent.*;
 
 /**
  * @author Boris Grozev
@@ -38,6 +42,17 @@ public class ColibriWebSocket extends WebSocketAdapter
     private final EventHandler eventHandler;
 
     /**
+     * The clock used to compute lastSendTime.
+     */
+    private final Clock clock = Clock.systemUTC();
+
+    /** The last time something was sent on this web socket */
+    private Instant lastSendTime = Instant.MIN;
+
+    /** The recurring task to send pings on the connection, if needed. */
+    private ScheduledFuture<?> pinger = null;
+
+    /**
      * Initializes a new {@link ColibriWebSocket} instance.
      */
     public ColibriWebSocket(
@@ -45,7 +60,7 @@ public class ColibriWebSocket extends WebSocketAdapter
         EventHandler eventHandler
     )
     {
-        this.logger = new LoggerImpl(getClass().getName(), new LogContext(JMap.of("id", id)));
+        this.logger = new LoggerImpl(getClass().getName(), new LogContext(Map.of("id", id)));
         this.eventHandler = Objects.requireNonNull(eventHandler, "eventHandler");
     }
 
@@ -72,6 +87,14 @@ public class ColibriWebSocket extends WebSocketAdapter
     {
         super.onWebSocketConnect(sess);
 
+        if (WebsocketServiceConfig.config.getSendKeepalivePings())
+        {
+            pinger = TaskPools.SCHEDULED_POOL.scheduleAtFixedRate(this::maybeSendPing,
+                WebsocketServiceConfig.config.getKeepalivePingInterval().toMillis(),
+                WebsocketServiceConfig.config.getKeepalivePingInterval().toMillis(),
+                TimeUnit.MILLISECONDS);
+        }
+
         eventHandler.webSocketConnected(this);
     }
 
@@ -82,9 +105,69 @@ public class ColibriWebSocket extends WebSocketAdapter
     public void onWebSocketClose(int statusCode, String reason)
     {
         eventHandler.webSocketClosed(this, statusCode, reason);
+        if (pinger != null)
+        {
+            pinger.cancel(true);
+        }
     }
 
-    public interface EventHandler {
+    public void sendString(String message)
+    {
+        RemoteEndpoint remote = getRemote();
+        if (remote != null)
+        {
+            // We'll use the async version of sendString since this may be called
+            // from multiple threads.  It's just fire-and-forget though, so we
+            // don't wait on the result
+
+            remote.sendString(message, WriteCallback.NOOP);
+            synchronized (this)
+            {
+                lastSendTime = clock.instant();
+            }
+        }
+    }
+
+    private void maybeSendPing()
+    {
+        try
+        {
+            Instant now = clock.instant();
+            synchronized (this)
+            {
+                if (Duration.between(lastSendTime, now).
+                    compareTo(WebsocketServiceConfig.config.getKeepalivePingInterval()) < 0)
+                {
+                    RemoteEndpoint remote = getRemote();
+                    if (remote != null)
+                    {
+                        remote.sendPing(ByteBuffer.allocate(0), WriteCallback.NOOP);
+                        lastSendTime = clock.instant();
+                    }
+                }
+            }
+        }
+        catch (Exception e)
+        {
+            logger.error("Error sending websocket ping", e);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    @Override
+    public void onWebSocketError(Throwable cause)
+    {
+        eventHandler.webSocketError(this, cause);
+        if (pinger != null)
+        {
+            pinger.cancel(true);
+        }
+    }
+
+    public interface EventHandler
+    {
         /**
          * Notifies that a specific {@link ColibriWebSocket}
          * instance associated with it has been closed.
@@ -103,5 +186,12 @@ public class ColibriWebSocket extends WebSocketAdapter
          * @param ws the {@link ColibriWebSocket} from which a message was received.
          */
         void webSocketTextReceived(ColibriWebSocket ws, String message);
+
+        /**
+         * An error occurred for a specific websocket.
+         * @param ws the websocket.
+         * @param cause the cause of the error.
+         */
+        void webSocketError(ColibriWebSocket ws, Throwable cause);
     }
 }

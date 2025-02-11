@@ -18,15 +18,17 @@ package org.jitsi.videobridge.websocket
 
 import org.eclipse.jetty.servlet.ServletContextHandler
 import org.eclipse.jetty.servlet.ServletHolder
+import org.eclipse.jetty.websocket.server.config.JettyWebSocketServletContainerInitializer
 import org.jitsi.utils.logging2.createLogger
 import org.jitsi.videobridge.Videobridge
+import org.jitsi.videobridge.relay.RelayConfig
 import org.jitsi.videobridge.websocket.config.WebsocketServiceConfig.Companion.config
 
 class ColibriWebSocketService(
     webserverIsTls: Boolean
 ) {
-    private val baseUrl: String?
-    private val relayUrl: String? /* TODO: only enable this if secure octo is enabled? */
+    private val baseUrls: List<String>
+    private val relayBaseUrls: List<String>
 
     init {
         // We default to matching the protocol used by the local jetty
@@ -35,13 +37,25 @@ class ColibriWebSocketService(
         if (config.enabled) {
             val useTls = config.useTls ?: webserverIsTls
             val protocol = if (useTls) "wss" else "ws"
-            baseUrl = "$protocol://${config.domain}/$COLIBRI_WS_ENDPOINT/${config.serverId}"
-            relayUrl = "$protocol://${config.domain}/$COLIBRI_RELAY_WS_ENDPOINT/${config.serverId}"
-            logger.info("Base URL: $baseUrl Relay URL: $relayUrl")
+            baseUrls = config.domains.map {
+                "$protocol://$it/$COLIBRI_WS_ENDPOINT/${config.serverId}"
+            }
+            relayBaseUrls = if (RelayConfig.config.enabled) {
+                config.relayDomains.map {
+                    "$protocol://$it/$COLIBRI_RELAY_WS_ENDPOINT/${config.serverId}"
+                }
+            } else {
+                emptyList()
+            }
+            if (baseUrls.isEmpty() || relayBaseUrls.isEmpty()) {
+                logger.warn("Websockets enabled, but no domains specified: URLs=$baseUrls, Relay URLs=$relayBaseUrls")
+            } else {
+                logger.info("Base URL: $baseUrls Relay URL: $relayBaseUrls")
+            }
         } else {
             logger.info("WebSockets are not enabled")
-            baseUrl = null
-            relayUrl = null
+            baseUrls = emptyList()
+            relayBaseUrls = emptyList()
         }
     }
 
@@ -50,12 +64,9 @@ class ColibriWebSocketService(
      * ID [conferenceId] to use to connect to the websocket with password [pwd] or null if the
      * [ColibriWebSocketService] is not enabled.
      */
-    fun getColibriWebSocketUrl(conferenceId: String, endpointId: String, pwd: String): String? {
-        if (!config.enabled) {
-            return null
-        }
+    fun getColibriWebSocketUrls(conferenceId: String, endpointId: String, pwd: String): List<String> {
         // "wss://example.com/colibri-ws/server-id/conf-id/endpoint-id?pwd=123
-        return "$baseUrl/$conferenceId/$endpointId?pwd=$pwd"
+        return baseUrls.map { "$it/$conferenceId/$endpointId?pwd=$pwd" }
     }
 
     /**
@@ -63,25 +74,22 @@ class ColibriWebSocketService(
      * ID [conferenceId] to use to connect to the websocket with password [pwd] or null if the
      * [ColibriWebSocketService] is not enabled.
      */
-    fun getColibriRelayWebSocketUrl(conferenceId: String, relayId: String, pwd: String): String? {
-        if (!config.enabled) {
-            return null
-        }
-        // "wss://example.com/colibri-relay-ws/server-id/conf-id/endpoint-id?pwd=123
-        return "$relayUrl/$conferenceId/$relayId?pwd=$pwd"
+    fun getColibriRelayWebSocketUrls(conferenceId: String, relayId: String, pwd: String): List<String> {
+        // "wss://example.com/colibri-relay-ws/server-id/conf-id/relay-id?pwd=123
+        return relayBaseUrls.map { "$it/$conferenceId/$relayId?pwd=$pwd" }
     }
 
-    fun registerServlet(
-        servletContextHandler: ServletContextHandler,
-        videobridge: Videobridge
-    ) {
+    fun registerServlet(servletContextHandler: ServletContextHandler, videobridge: Videobridge) {
         if (config.enabled) {
-            logger.info("Registering servlet with baseUrl = $baseUrl, relayUrl = $relayUrl")
+            logger.info("Registering servlet with baseUrls = $baseUrls, relayBaseUrls = $relayBaseUrls")
             val holder = ServletHolder().apply {
                 servlet = ColibriWebSocketServlet(config.serverId, videobridge)
             }
             servletContextHandler.addServlet(holder, "/$COLIBRI_WS_ENDPOINT/*")
             servletContextHandler.addServlet(holder, "/$COLIBRI_RELAY_WS_ENDPOINT/*")
+            /* TODO, if you want to register additional Websocket servlets elsewhere:
+                factor this out, it should only be called once. */
+            JettyWebSocketServletContainerInitializer.configure(servletContextHandler, null)
         } else {
             logger.info("Disabled, not registering servlet")
         }
@@ -89,6 +97,7 @@ class ColibriWebSocketService(
 
     companion object {
         private val logger = createLogger()
+
         /**
          * The root path of the HTTP endpoint for COLIBRI WebSockets.
          */

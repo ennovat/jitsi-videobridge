@@ -19,31 +19,18 @@ package org.jitsi.videobridge.rest.root.colibri.stats;
 import org.jitsi.videobridge.rest.*;
 import org.jitsi.videobridge.rest.annotations.*;
 import org.jitsi.videobridge.stats.*;
-import org.json.simple.*;
-import org.jvnet.hk2.annotations.*;
 
-import javax.inject.*;
-import javax.ws.rs.*;
-import javax.ws.rs.core.*;
+import jakarta.ws.rs.*;
+import jakarta.ws.rs.core.*;
 
 @Path("/colibri/stats")
 @EnabledByConfig(RestApis.COLIBRI)
 public class Stats
 {
-    @Inject
-    @Optional
-    protected StatsCollector statsManager;
-
     @GET
     @Produces(MediaType.APPLICATION_JSON)
     public String getStats()
     {
-        StatsCollector statsManager = this.statsManager;
-
-        if (this.statsManager != null)
-        {
-            return new JSONObject(statsManager.getStatistics().getStats()).toJSONString();
-        }
-        return new JSONObject().toJSONString();
+        return VideobridgeStatisticsShim.INSTANCE.getStatsJson().toJSONString();
     }
 }
